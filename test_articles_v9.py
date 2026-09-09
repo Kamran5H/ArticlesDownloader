@@ -166,9 +166,9 @@ def test_cli_live_harvest():
         test_dir = Path(tmpdir)
         ctx = art.DownloadContext(run_id=999, target_downloads=2, save_folder=test_dir)
         downloaded = art.execute_research_workflow(
-            keywords="zinc air battery electrocatalyst",
-            focus="recent",
-            year_start="2024",
+            keywords="LATP",
+            focus="solid electrolyte",
+            year_start="2023",
             year_end="2026",
             max_articles=2,
             save_folder=test_dir,

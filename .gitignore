@@ -1,0 +1,29 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Runtime SQLite databases
+*.db
+*.db-shm
+*.db-wal
+research_history.db
+
+# Downloads & output PDFs
+*.pdf
+results.csv
+references.*
+corpus_metadata.json
+
+# Logs & Virtual environments
+*.log
+.venv/
+venv/
+env/
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -51,7 +51,6 @@ from dataclasses import dataclass, field
 import hashlib
 import html
 import json
-import math
 import os
 from pathlib import Path
 import random
@@ -78,13 +77,11 @@ def enable_high_dpi_awareness():
 
 enable_high_dpi_awareness()
 
-# Suppress urllib3 and requests dependency mismatch warnings
+# Suppress urllib3 and requests dependency mismatch warnings cleanly
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+warnings.filterwarnings("ignore", message=".*RequestsDependencyWarning.*")
 warnings.filterwarnings("ignore", category=UserWarning, module="requests")
-try:
-    from requests.exceptions import RequestsDependencyWarning
-    warnings.filterwarnings("ignore", category=RequestsDependencyWarning)
-except ImportError:
-    pass
+
 
 # Ensure standard UTF-8 console output for Windows
 if hasattr(sys.stdout, "reconfigure"):
@@ -95,7 +92,6 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import threading
 import time
-import urllib.parse
 import urllib3
 import xml.etree.ElementTree as ET
 
@@ -210,6 +206,22 @@ log_widget = None
 cancellation_event = threading.Event()
 log_file_path: Path | None = None
 
+import queue
+_sse_subscribers: list[queue.Queue] = []
+_subscribers_lock = threading.Lock()
+
+def _broadcast_sse(event_data: dict):
+    with _subscribers_lock:
+        dead = []
+        for q in _sse_subscribers:
+            try:
+                q.put_nowait(event_data)
+            except Exception:
+                dead.append(q)
+        for q in dead:
+            if q in _sse_subscribers:
+                _sse_subscribers.remove(q)
+
 active_run_id = 0
 lock_run_id = threading.Lock()
 
@@ -254,22 +266,24 @@ def _log(msg: str, run_id: int | None = None, tag: str | None = None, color: str
         except Exception:
             pass
 
+    active_tag = tag or color
+    if not active_tag:
+        if "✅" in msg or "🏆" in msg:
+            active_tag = "success"
+        elif "❌" in msg or "🛑" in msg:
+            active_tag = "error"
+        elif any(sym in msg for sym in ["📡", "🎯", "🚀", "📖", "🔬", "🔎"]):
+            active_tag = "info"
+        elif any(sym in msg for sym in ["⏳", "⚠️", "⚡"]):
+            active_tag = "warning"
+
+    _broadcast_sse({"type": "log", "message": msg, "tag": active_tag})
+
     if log_widget:
         try:
             def _insert():
                 try:
                     log_widget.configure(state="normal")
-                    active_tag = tag or color
-                    if not active_tag:
-                        if "✅" in msg or "🏆" in msg:
-                            active_tag = "success"
-                        elif "❌" in msg or "🛑" in msg:
-                            active_tag = "error"
-                        elif "📡" in msg or "🎯" in msg or "🚀" in msg or "📖" in msg or "🔬" in msg or "🔎" in msg:
-                            active_tag = "info"
-                        elif "⏳" in msg or "⚠️" in msg or "⚡" in msg:
-                            active_tag = "warning"
-                    
                     if active_tag:
                         log_widget.insert("end", msg + "\n", active_tag)
                     else:
@@ -304,12 +318,21 @@ def is_cancelled(ctx: DownloadContext | None = None) -> bool:
 #  CLEANING & TEXT PARSING
 # ══════════════════════════════════════════════════════════════════════════════
 
+_SUB_SUPER_MAP = str.maketrans({
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+    "⁺": "+", "⁻": "-", "₋": "-", "₊": "+",
+})
+
 def clean_title(raw_title: str) -> str:
-    """Unescape HTML entities, strip XML/HTML tags, and collapse spaces."""
+    """Unescape HTML entities, strip XML/HTML tags, normalize subscripts/superscripts, and collapse spaces."""
     if not raw_title:
         return "Untitled"
     t = re.sub(r'</?[a-zA-Z][a-zA-Z0-9:\-_]*[^>]*>', '', raw_title)
     t = html.unescape(html.unescape(t))
+    t = t.translate(_SUB_SUPER_MAP)
     t = re.sub(r"\s+", " ", t).strip()
     return t or "Untitled"
 
@@ -364,10 +387,14 @@ def _authors_apa(authors: list[str]) -> str:
     return ", ".join(out[:19]) + ", ... " + out[-1]
 
 def _escape_bibtex(s: str) -> str:
+    """Escape LaTeX-fragile characters in human text (title/journal/author/note)."""
     if not s:
         return ""
-    for char in ["\\", "{", "}", "%", "$", "&", "_", "#"]:
+    # Backslash first so we don't double-escape the escapes we add below.
+    s = s.replace("\\", r"\textbackslash{}")
+    for char in ["{", "}", "%", "$", "&", "_", "#"]:
         s = s.replace(char, f"\\{char}")
+    s = s.replace("~", r"\textasciitilde{}").replace("^", r"\textasciicircum{}")
     return s
 
 def _bib_key(p: Paper, used: set[str]) -> str:
@@ -389,10 +416,10 @@ def _format_bibtex_entry(p: Paper) -> str:
     key = _bib_key(p, set())
     lines = [f"@article{{{key},"]
     if p.authors:
-        lines.append(f"  author  = {{{' and '.join(p.authors)}}},")
-    lines.append(f"  title   = {{{{{clean_title(p.title)}}}}},")
+        lines.append(f"  author  = {{{' and '.join(_escape_bibtex(a) for a in p.authors)}}},")
+    lines.append(f"  title   = {{{{{_escape_bibtex(clean_title(p.title))}}}}},")
     if p.journal:
-        lines.append(f"  journal = {{{p.journal}}},")
+        lines.append(f"  journal = {{{_escape_bibtex(p.journal)}}},")
     if p.year:
         lines.append(f"  year    = {{{p.year}}},")
     if p.doi:
@@ -850,6 +877,19 @@ JOURNAL_ABBREV_MAP = {
     "rev": "review", "adv": "advanced", "soc": "society", "am": "american",
     "nat": "nature", "commun": "communications", "electrochim": "electrochimica",
     "acta": "acta", "sol": "solid", "state": "state", "ion": "ionics",
+    "sci": "science", "technol": "technology", "res": "research", "energ": "energy",
+    "acs": "acs", "rsc": "rsc", "ieee": "ieee", "iop": "iop",
+    "ann": "annual", "rep": "reports", "proc": "proceedings", "trans": "transactions",
+    "mol": "molecular", "biol": "biological", "biophys": "biophysical", "biochem": "biochemical",
+    "nanotechnol": "nanotechnology", "nano": "nano", "micro": "micro", "spectrosc": "spectroscopy",
+    "struct": "structural", "environ": "environmental", "sust": "sustainable", "renew": "renewable",
+    "comput": "computational", "theor": "theoretical", "exper": "experimental",
+    "catal": "catalysis", "polym": "polymer", "macromol": "macromolecular",
+    "inorg": "inorganic", "org": "organic", "anal": "analytical", "colloid": "colloids",
+    "interf": "interface", "interfaces": "interfaces", "part": "part", "syst": "systems",
+    "electr": "electronic", "power": "power", "storage": "storage", "sources": "sources",
+    "gener": "generation", "front": "frontiers", "curr": "current", "opin": "opinion",
+    "trends": "trends", "perspect": "perspectives", "nanoscale": "nanoscale",
 }
 
 def _norm_issn(s: str) -> str:
@@ -858,20 +898,35 @@ def _norm_issn(s: str) -> str:
 JOURNAL_CONNECTOR_STOPWORDS = {"and", "of", "the", "for", "in", "on", "to", "with", "a", "an"}
 
 def _norm_journal_variants(name: str) -> list[str]:
-    raw = re.sub(r"\W+", " ", (name or "").lower()).strip()
-    if not raw:
+    raw_input = (name or "").strip()
+    if not raw_input:
         return []
-    variants = [raw]
-    tokens = raw.split()
-    expanded = [JOURNAL_ABBREV_MAP.get(t, t) for t in tokens]
-    exp_str = " ".join(expanded)
-    if exp_str not in variants:
-        variants.append(exp_str)
-    no_stop = [t for t in expanded if t not in JOURNAL_CONNECTOR_STOPWORDS]
-    no_stop_str = " ".join(no_stop)
-    if no_stop_str and no_stop_str not in variants:
-        variants.append(no_stop_str)
+    candidates = [raw_input]
+    if ":" in raw_input:
+        candidates.append(raw_input.split(":", 1)[0].strip())
+    if " - " in raw_input:
+        candidates.append(raw_input.split(" - ", 1)[0].strip())
+    if " – " in raw_input:
+        candidates.append(raw_input.split(" – ", 1)[0].strip())
+
+    variants: list[str] = []
+    for cand in candidates:
+        raw = re.sub(r"\W+", " ", cand.lower()).strip()
+        if not raw:
+            continue
+        if raw not in variants:
+            variants.append(raw)
+        tokens = raw.split()
+        expanded = [JOURNAL_ABBREV_MAP.get(t, t) for t in tokens]
+        exp_str = " ".join(expanded)
+        if exp_str not in variants:
+            variants.append(exp_str)
+        no_stop = [t for t in expanded if t not in JOURNAL_CONNECTOR_STOPWORDS]
+        no_stop_str = " ".join(no_stop)
+        if no_stop_str and no_stop_str not in variants:
+            variants.append(no_stop_str)
     return variants
+
 
 def load_scimago_quartiles() -> tuple[dict[str, str], dict[str, str]]:
     """Load Scimago quartiles indexed by ISSN and Journal Title (with abbreviation expansion)."""
@@ -930,6 +985,9 @@ def load_scimago_quartiles() -> tuple[dict[str, str], dict[str, str]]:
         return _scimago_issn_map, _scimago_title_map
 
 def quartile_for(issns: list[str], journal: str = "") -> str:
+    global _scimago_issn_map, _scimago_title_map
+    if _scimago_issn_map is None or _scimago_title_map is None:
+        load_scimago_quartiles()
     issn_map, title_map = _scimago_issn_map or {}, _scimago_title_map or {}
     # Primary: check ISSN
     for iss in issns:
@@ -1604,7 +1662,12 @@ def enrich_with_openalex(papers: list[Paper], ctx: DownloadContext | None = None
             continue
         failed_batches = 0
 
-        for item in r.json().get("results", []):
+        try:
+            batch_results = r.json().get("results", [])
+        except Exception:
+            failed_batches += 1
+            continue
+        for item in batch_results:
             d = (_extract_doi(item.get("doi") or "") or "").lower()
             p = by_doi.get(d)
             if not p:
@@ -2137,10 +2200,10 @@ def write_bibliography(papers: list[Paper], folder: Path):
             key = _bib_key(p, used_keys)
             f.write(f"@article{{{key},\n")
             if p.authors:
-                f.write(f"  author  = {{{' and '.join(p.authors)}}},\n")
-            f.write(f"  title   = {{{{{clean_title(p.title)}}}}},\n")
+                f.write(f"  author  = {{{' and '.join(_escape_bibtex(a) for a in p.authors)}}},\n")
+            f.write(f"  title   = {{{{{_escape_bibtex(clean_title(p.title))}}}}},\n")
             if p.journal:
-                f.write(f"  journal = {{{p.journal}}},\n")
+                f.write(f"  journal = {{{_escape_bibtex(p.journal)}}},\n")
             if p.year:
                 f.write(f"  year    = {{{p.year}}},\n")
             if p.doi:
@@ -2240,7 +2303,12 @@ def write_bibliography(papers: list[Paper], folder: Path):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _history_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(HISTORY_DB))
+    conn = sqlite3.connect(str(HISTORY_DB), timeout=30.0)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS history (
             query TEXT,
@@ -2330,7 +2398,7 @@ def execute_research_workflow(
     paper_callback=None,
 ) -> list[Paper]:
     """Autonomous execution of literature harvest, ranking, download and citations."""
-    global seen_urls, seen_dois, seen_titles, log_file_path
+    global log_file_path
 
     folder = Path(save_folder) if save_folder else get_default_save_folder()
     q_hi = folder / "Q1_Q2"
@@ -2362,7 +2430,7 @@ def execute_research_workflow(
     if status_callback:
         status_callback("Phase 1: Searching scholarly databases…", "#58a6ff")
     _log(f"\n{'═'*65}", run_id=run_id)
-    _log(f"  🚀 RESEARCH PDF DOWNLOADER — v10 Ultra Pro", run_id=run_id)
+    _log("  🚀 RESEARCH PDF DOWNLOADER — v10 Ultra Pro", run_id=run_id)
     _log(f"  Query: {keywords} | Focus: {focus or 'None'} | Years: {year_start}-{year_end}", run_id=run_id)
     _log(f"  Target: {max_articles} PDFs | Filter: {quartile_filter} | Min Match: {int(min_relevance*100)}%", run_id=run_id)
     _log(f"  Folder: {folder}", run_id=run_id)
@@ -2441,11 +2509,20 @@ def execute_research_workflow(
         status_callback("Phase 2: Ranking by journal quartile & citations…", "#58a6ff")
     _log(f"\n📈 Phase 2: Processing {len(papers)} candidate papers…", run_id=run_id)
 
-    load_scimago_quartiles()
-    enrich_with_openalex(papers, ctx=ctx)
+    try:
+        load_scimago_quartiles()
+    except Exception as e:
+        _log(f"  ⚠️  Scimago ranking unavailable ({e}); continuing unranked.", run_id=run_id)
+    try:
+        enrich_with_openalex(papers, ctx=ctx)
+    except Exception as e:
+        _log(f"  ⚠️  Metadata enrichment skipped ({e}); using harvested metadata.", run_id=run_id)
 
     for p in papers:
-        p.quartile = quartile_for(p.issns, p.journal)
+        try:
+            p.quartile = quartile_for(p.issns, p.journal)
+        except Exception:
+            p.quartile = ""
 
     # Apply user quartile filter
     if quartile_filter == "q1_q2":
@@ -2577,7 +2654,7 @@ def execute_research_workflow(
     # ── PHASE 4: Citations & Memory ───────────────────────────────────────────
     downloaded = [p for p in filtered if p.pdf_path]
     if downloaded:
-        _log(f"\n📚 Writing references.bib, .ris, APA 7th, results.csv, corpus_metadata.json…", run_id=run_id)
+        _log("\n📚 Writing references.bib, .ris, APA 7th, results.csv, corpus_metadata.json…", run_id=run_id)
         try:
             write_bibliography(downloaded, folder)
         except Exception as e:
@@ -3101,13 +3178,17 @@ if HAS_TKINTER:
 
         def _open_download_folder(self):
             folder_str = self.ent_folder.get().strip()
-            if folder_str:
+            if not folder_str:
+                return
+            try:
                 p = Path(folder_str)
                 p.mkdir(parents=True, exist_ok=True)
                 if sys.platform == "win32":
                     os.startfile(str(p))
                 else:
                     subprocess.Popen(["xdg-open", str(p)])
+            except Exception as e:
+                messagebox.showerror("Open Folder", f"Could not open the folder:\n{e}")
 
         def _on_paper_downloaded(self, p: Paper, res: dict):
             def _ui_insert():
@@ -3144,20 +3225,28 @@ if HAS_TKINTER:
         def _open_selected_pdf(self):
             p = self._get_selected_paper()
             if p and p.pdf_path and Path(p.pdf_path).exists():
-                if sys.platform == "win32":
-                    os.startfile(p.pdf_path)
-                else:
-                    subprocess.Popen(["xdg-open", p.pdf_path])
+                try:
+                    if sys.platform == "win32":
+                        os.startfile(p.pdf_path)
+                    else:
+                        subprocess.Popen(["xdg-open", p.pdf_path])
+                except Exception as e:
+                    messagebox.showerror("Open PDF", f"Could not open the PDF:\n{e}")
+            elif p and p.pdf_path:
+                messagebox.showwarning("Open PDF", "The PDF file is no longer at its saved location.")
             else:
                 messagebox.showinfo("Open PDF", "Please select a downloaded paper from the list first.")
 
         def _show_in_explorer(self):
             p = self._get_selected_paper()
             if p and p.pdf_path and Path(p.pdf_path).exists():
-                if sys.platform == "win32":
-                    subprocess.Popen(f'explorer /select,"{p.pdf_path}"')
-                else:
-                    subprocess.Popen(["xdg-open", str(Path(p.pdf_path).parent)])
+                try:
+                    if sys.platform == "win32":
+                        subprocess.Popen(f'explorer /select,"{p.pdf_path}"')
+                    else:
+                        subprocess.Popen(["xdg-open", str(Path(p.pdf_path).parent)])
+                except Exception as e:
+                    messagebox.showerror("Show in Explorer", f"Could not open the file location:\n{e}")
 
         def _copy_selected_doi(self):
             p = self._get_selected_paper()
@@ -3212,8 +3301,13 @@ if HAS_TKINTER:
                 csv_path = Path(folder_str) / "results.csv"
                 if csv_path.exists():
                     self.set_status(f"CSV available at: {csv_path}", self.EMERALD)
-                    if sys.platform == "win32":
-                        os.startfile(str(csv_path))
+                    try:
+                        if sys.platform == "win32":
+                            os.startfile(str(csv_path))
+                        else:
+                            subprocess.Popen(["xdg-open", str(csv_path)])
+                    except Exception as e:
+                        messagebox.showerror("Export CSV", f"Could not open results.csv:\n{e}")
                     return
             messagebox.showinfo("Export CSV", "Harvesting must complete to generate results.csv.")
 
@@ -3297,8 +3391,17 @@ if HAS_TKINTER:
             self.lbl_card_relevance_num.configure(text=f"{avg_rel:.0f}% Avg")
             self.lbl_card_relevance_sub.configure(text=f"Threshold: {min_rel_pct}% match")
 
+        def _stats_ticker(self, token: int | None = None):
+            # Single self-perpetuating 1s refresh loop, guarded by a token so a new
+            # run cancels any ticker left over from a previous run (no overlap).
+            if token is None:
+                self._stats_token = getattr(self, "_stats_token", 0) + 1
+                token = self._stats_token
+            if token != getattr(self, "_stats_token", 0):
+                return
+            self.update_stats()
             if self.is_running:
-                self.root.after(1000, self.update_stats)
+                self.root.after(1000, lambda: self._stats_ticker(token))
 
         def enable_inputs(self, enable=True):
             def _do():
@@ -3440,10 +3543,23 @@ if HAS_TKINTER:
             self.lbl_card_relevance_sub.configure(text=f"Threshold: {int(min_rel * 100)}% match")
 
             folder = Path(save_path)
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                probe = folder / ".write_test"
+                probe.touch()
+                probe.unlink()
+            except Exception as e:
+                messagebox.showerror(
+                    "Save Folder Unavailable",
+                    f"Cannot write to the selected folder:\n{save_path}\n\n{e}\n\n"
+                    "Pick a different destination and try again.",
+                )
+                return
+
             self.ctx = DownloadContext(current_run_id, max_val, folder)
             self.is_running = True
             self.enable_inputs(False)
-            self.update_stats()
+            self._stats_ticker()
 
             def _thread_worker():
                 try:
@@ -3471,6 +3587,460 @@ if HAS_TKINTER:
             self.worker_thread.start()
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  NEXT-GEN WEB APPLICATION SERVER & NATIVE DESKTOP APP WINDOW
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from flask import Flask, request, jsonify, Response, send_file
+    HAS_FLASK = True
+except ImportError:
+    HAS_FLASK = False
+
+class ResearchWebController:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.is_running = False
+        self.worker_thread: threading.Thread | None = None
+        self.ctx: DownloadContext | None = None
+        self.downloaded_papers: list[dict] = []
+        self.current_folder = str(get_default_save_folder())
+        self.progress = 0.0
+        self.phase = "idle"
+        self.status_text = "Ready — configure parameters and click Start Literature Harvest"
+        self.target_articles = 50
+        self.downloaded_count = 0
+        self.total_bytes = 0
+        self.q1_count = 0
+        self.q2_count = 0
+        self.q3_count = 0
+        self.q4_count = 0
+        self.avg_relevance = 1.0
+
+    def get_status_dict(self) -> dict:
+        with self.lock:
+            return {
+                "is_running": self.is_running,
+                "progress": round(self.progress, 1),
+                "phase": self.phase,
+                "status_text": self.status_text,
+                "downloaded": self.downloaded_count,
+                "target": self.target_articles,
+                "bytes": self.total_bytes,
+                "q1": self.q1_count,
+                "q2": self.q2_count,
+                "q3": self.q3_count,
+                "q4": self.q4_count,
+                "avg_relevance": round(self.avg_relevance, 2),
+                "folder": self.current_folder,
+                "papers": list(self.downloaded_papers),
+            }
+
+    def start(self, payload: dict) -> dict:
+        with self.lock:
+            if self.is_running:
+                return {"status": "error", "message": "Harvest already in progress."}
+
+            keywords = (payload.get("keywords") or "").strip()
+            if not keywords:
+                return {"status": "error", "message": "Keywords are required."}
+
+            focus = (payload.get("focus") or "").strip()
+            y1 = str(payload.get("year_start") or "2023").strip()
+            y2 = str(payload.get("year_end") or "2026").strip()
+            max_val = int(payload.get("max_articles") or 50)
+            q_filter = str(payload.get("quartile_filter") or "all_ranked").strip()
+            mode = str(payload.get("mode") or "fresh").strip()
+            min_rel = float(payload.get("min_relevance") or DEFAULT_MIN_RELEVANCE)
+            folder_str = (payload.get("save_folder") or "").strip()
+            folder = Path(folder_str) if folder_str else get_default_save_folder()
+
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                return {"status": "error", "message": f"Cannot write to folder: {e}"}
+
+            global active_run_id
+            with lock_run_id:
+                active_run_id += 1
+                current_run_id = active_run_id
+
+            self.current_folder = str(folder)
+            self.target_articles = max_val
+            self.downloaded_count = 0
+            self.total_bytes = 0
+            self.q1_count = 0
+            self.q2_count = 0
+            self.q3_count = 0
+            self.q4_count = 0
+            self.avg_relevance = 1.0
+            self.downloaded_papers = []
+            self.progress = 5.0
+            self.phase = "harvesting"
+            self.status_text = f"Harvesting across 9 scholarly APIs for '{keywords}'..."
+            self.is_running = True
+            self.ctx = DownloadContext(current_run_id, max_val, folder)
+
+            def _progress_cb(pct: float, msg: str):
+                with self.lock:
+                    self.progress = pct
+                    self.status_text = msg
+                    if pct < 25:
+                        self.phase = "harvesting"
+                    elif pct < 35:
+                        self.phase = "filtering"
+                    elif pct < 45:
+                        self.phase = "ranking"
+                    elif pct < 90:
+                        self.phase = "downloading"
+                    else:
+                        self.phase = "citations"
+                _broadcast_sse({
+                    "type": "progress",
+                    "percent": pct,
+                    "phase": self.phase,
+                    "message": msg
+                })
+
+            def _status_cb(msg: str, color: str = ""):
+                with self.lock:
+                    self.status_text = msg
+                _broadcast_sse({
+                    "type": "progress",
+                    "percent": self.progress,
+                    "phase": self.phase,
+                    "message": msg
+                })
+
+            def _paper_cb(p: Paper, res: dict):
+                size_kb = res.get("bytes", 0) // 1024
+                size_str = f"{size_kb / 1024:.2f} MB" if size_kb > 1024 else f"{size_kb} KB"
+                q = (p.quartile or "Unranked").upper()
+                with self.lock:
+                    self.downloaded_count += 1
+                    self.total_bytes += res.get("bytes", 0)
+                    if q == "Q1":
+                        self.q1_count += 1
+                    elif q == "Q2":
+                        self.q2_count += 1
+                    elif q == "Q3":
+                        self.q3_count += 1
+                    elif q == "Q4":
+                        self.q4_count += 1
+
+                    p_dict = {
+                        "title": clean_title(p.title),
+                        "authors": p.authors,
+                        "year": p.year,
+                        "journal": p.journal,
+                        "doi": p.clean_doi(),
+                        "citations": p.citations,
+                        "quartile": p.quartile or "Unranked",
+                        "relevance_score": p.relevance_score,
+                        "source": p.source,
+                        "pdf_path": p.pdf_path,
+                        "size_str": size_str,
+                        "abstract": p.abstract or "",
+                    }
+                    self.downloaded_papers.append(p_dict)
+                    total_rel = sum(x["relevance_score"] for x in self.downloaded_papers)
+                    self.avg_relevance = total_rel / len(self.downloaded_papers) if self.downloaded_papers else 1.0
+
+                _broadcast_sse({"type": "paper", "paper": p_dict})
+
+            def _thread_worker():
+                try:
+                    execute_research_workflow(
+                        keywords=keywords,
+                        focus=focus,
+                        year_start=y1,
+                        year_end=y2,
+                        max_articles=max_val,
+                        save_folder=folder,
+                        quartile_filter=q_filter,
+                        mode=mode,
+                        min_relevance=min_rel,
+                        ctx=self.ctx,
+                        paper_callback=_paper_cb,
+                        progress_callback=_progress_cb,
+                        status_callback=_status_cb,
+                    )
+                except Exception as e:
+                    _log(f"❌ Execution error: {e}", run_id=current_run_id)
+                finally:
+                    with self.lock:
+                        self.is_running = False
+                        self.phase = "complete"
+                        self.progress = 100.0
+                        self.status_text = f"Harvest complete — {self.downloaded_count} PDFs saved to {self.current_folder}"
+                    _broadcast_sse({"type": "complete", "status": self.get_status_dict()})
+
+            self.worker_thread = threading.Thread(target=_thread_worker, daemon=True)
+            self.worker_thread.start()
+            return {"status": "ok", "message": "Harvest started"}
+
+    def cancel(self) -> dict:
+        with self.lock:
+            if self.ctx:
+                self.ctx.cancellation_event.set()
+            self.is_running = False
+            self.status_text = "Harvest cancelled by user."
+        _broadcast_sse({"type": "progress", "percent": self.progress, "phase": "cancelled", "message": "Harvest cancelled by user."})
+        return {"status": "ok", "message": "Harvest cancelled"}
+
+web_controller = ResearchWebController()
+
+def create_flask_app():
+    if not HAS_FLASK:
+        return None
+
+    app = Flask("ArticlesDownloader", static_folder=None)
+    app.config["JSON_AS_ASCII"] = False
+
+    @app.after_request
+    def add_headers(resp):
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return resp
+
+    @app.route("/")
+    def index():
+        ui_file = SCRIPT_DIR / "articles_ui.html"
+        if ui_file.exists():
+            return ui_file.read_text(encoding="utf-8")
+        return "<h1>Articles Downloader v10 Ultra Pro</h1><p>articles_ui.html not found.</p>"
+
+    @app.route("/api/status")
+    def api_status():
+        return jsonify(web_controller.get_status_dict())
+
+    @app.route("/api/start", methods=["POST"])
+    def api_start():
+        data = request.get_json(silent=True) or {}
+        return jsonify(web_controller.start(data))
+
+    @app.route("/api/cancel", methods=["POST"])
+    def api_cancel():
+        return jsonify(web_controller.cancel())
+
+    @app.route("/api/papers")
+    def api_papers():
+        with web_controller.lock:
+            return jsonify(list(web_controller.downloaded_papers))
+
+    @app.route("/api/history")
+    def api_history():
+        items = []
+        try:
+            conn = _history_conn()
+            rows = conn.execute("""
+                SELECT query, COUNT(DISTINCT identifier) as cnt, MAX(date) as last_date
+                FROM history
+                WHERE query IS NOT NULL AND query != ''
+                GROUP BY query
+                ORDER BY MAX(date) DESC, cnt DESC
+                LIMIT 40
+            """).fetchall()
+            conn.close()
+            for r in rows:
+                items.append({"query": r[0], "count": r[1], "date": r[2] or "Recent"})
+        except Exception as e:
+            items = []
+        return jsonify(items)
+
+    @app.route("/api/browse_folder", methods=["POST"])
+    def api_browse_folder():
+        folder = choose_folder_dialog(web_controller.current_folder)
+        return jsonify({"folder": folder})
+
+    @app.route("/api/open_folder", methods=["POST"])
+    def api_open_folder():
+        data = request.get_json(silent=True) or {}
+        folder_str = data.get("folder") or web_controller.current_folder
+        if folder_str and os.path.isdir(folder_str):
+            try:
+                if sys.platform == "win32":
+                    os.startfile(folder_str)
+                else:
+                    subprocess.Popen(["xdg-open", folder_str])
+                return jsonify({"status": "ok"})
+            except Exception as e:
+                return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": "Directory does not exist"}), 400
+
+    @app.route("/api/open_pdf", methods=["POST"])
+    def api_open_pdf():
+        data = request.get_json(silent=True) or {}
+        path = data.get("path")
+        if path and os.path.exists(path):
+            try:
+                if sys.platform == "win32":
+                    os.startfile(path)
+                else:
+                    subprocess.Popen(["xdg-open", path])
+                return jsonify({"status": "ok"})
+            except Exception as e:
+                return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": "PDF file does not exist"}), 404
+
+    @app.route("/api/reveal_pdf", methods=["POST"])
+    def api_reveal_pdf():
+        data = request.get_json(silent=True) or {}
+        path = data.get("path")
+        if path and os.path.exists(path):
+            try:
+                if sys.platform == "win32":
+                    subprocess.Popen(f'explorer /select,"{path}"')
+                else:
+                    subprocess.Popen(["xdg-open", str(Path(path).parent)])
+                return jsonify({"status": "ok"})
+            except Exception as e:
+                return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": "File does not exist"}), 404
+
+    @app.route("/api/pdf_file")
+    def api_pdf_file():
+        path = request.args.get("path", "")
+        if path and os.path.exists(path) and path.lower().endswith(".pdf"):
+            return send_file(path, mimetype="application/pdf")
+        return "PDF file not found", 404
+
+    @app.route("/api/export/<fmt>")
+    def api_export(fmt):
+        folder_str = request.args.get("folder") or web_controller.current_folder
+        folder = Path(folder_str) if folder_str else get_default_save_folder()
+        fname_map = {
+            "bib": "references.bib",
+            "ris": "references.ris",
+            "apa": "references_APA.txt",
+            "csv": "results.csv",
+            "json": "corpus_metadata.json",
+        }
+        target_name = fname_map.get(fmt.lower())
+        if target_name:
+            file_path = folder / target_name
+            if file_path.exists():
+                return send_file(str(file_path), as_attachment=True, download_name=target_name)
+        return "Requested export file does not exist in destination folder yet.", 404
+
+    @app.route("/api/stream")
+    def api_stream():
+        def event_stream():
+            q = queue.Queue(maxsize=1000)
+            with _subscribers_lock:
+                _sse_subscribers.append(q)
+            try:
+                init_event = {"type": "progress", "percent": web_controller.progress,
+                              "phase": web_controller.phase, "message": web_controller.status_text}
+                yield f"data: {json.dumps(init_event)}\n\n"
+                while True:
+                    try:
+                        ev = q.get(timeout=25.0)
+                        yield f"data: {json.dumps(ev)}\n\n"
+                    except queue.Empty:
+                        yield f": heartbeat\n\n"
+            finally:
+                with _subscribers_lock:
+                    if q in _sse_subscribers:
+                        _sse_subscribers.remove(q)
+
+        return Response(event_stream(), mimetype="text/event-stream")
+
+    return app
+
+def choose_folder_dialog(initial_dir=""):
+    """Native Windows folder browser dialog without leaving background windows."""
+    init_path = initial_dir or str(get_default_save_folder())
+    cmd = (
+        'Add-Type -AssemblyName System.Windows.Forms;'
+        '$f = New-Object System.Windows.Forms.FolderBrowserDialog;'
+        '$f.Description = "Select Research PDF Save Directory";'
+        f'$f.SelectedPath = "{init_path}";'
+        'if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }'
+    )
+    try:
+        res = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=30)
+        p = res.stdout.strip()
+        if p and os.path.isdir(p):
+            return p
+    except Exception:
+        pass
+    if HAS_TKINTER:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            folder = filedialog.askdirectory(initialdir=init_path)
+            root.destroy()
+            if folder and os.path.isdir(folder):
+                return folder
+        except Exception:
+            pass
+    return init_path
+
+def find_available_port(start_port: int = 5080) -> int:
+    import socket
+    for port in range(start_port, start_port + 50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('127.0.0.1', port)) != 0:
+                return port
+    return start_port
+
+def launch_native_window(url: str):
+    """Launch the Web App in standalone native application window mode."""
+    edge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    for exe in edge_paths + chrome_paths:
+        if os.path.exists(exe):
+            try:
+                subprocess.Popen([
+                    exe,
+                    f"--app={url}",
+                    "--window-size=1360,920",
+                    "--new-window",
+                ])
+                return True
+            except Exception:
+                pass
+    import webbrowser
+    webbrowser.open(url)
+    return True
+
+def run_web_app(port: int = 5080, open_window: bool = True):
+    """Run local Flask server and launch the native desktop application window."""
+    app = create_flask_app()
+    if not app:
+        print("Flask is not installed. Falling back to Tkinter GUI.")
+        if HAS_TKINTER:
+            ResearchAppDashboard().root.mainloop()
+        return
+
+    actual_port = find_available_port(port)
+    url = f"http://127.0.0.1:{actual_port}"
+    print(f"\n⚡ Articles Downloader v10 Ultra Pro — Obsidian 4K UI Server")
+    print(f"  🔗 Local Loopback: {url}")
+
+    if open_window:
+        def _delayed_launch():
+            time.sleep(0.8)
+            launch_native_window(url)
+        threading.Thread(target=_delayed_launch, daemon=True).start()
+
+    # Run loopback server
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    app.run(host="127.0.0.1", port=actual_port, threaded=True, debug=False)
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  CLI ARGUMENT PARSER & MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3492,13 +4062,17 @@ def parse_args():
     parser.add_argument("--min-relevance", "-r", type=float, default=DEFAULT_MIN_RELEVANCE,
                         help="Minimum relevance match threshold between 0.0 and 1.0 (default: 0.60 for 60%%)")
     parser.add_argument("--cli", "--no-gui", action="store_true", help="Run in headless command-line mode without GUI")
+    parser.add_argument("--tk", action="store_true", help="Run classic Tkinter GUI instead of modern Web App")
+    parser.add_argument("--web", action="store_true", help="Run Web App in browser tab rather than app window")
+    parser.add_argument("--port", type=int, default=5080, help="Local server port (default: 5080)")
+    parser.add_argument("--no-browser", action="store_true", help="Do not open browser/window automatically")
     return parser.parse_args()
 
 def main():
     args = parse_args()
 
-    # CLI mode
-    if args.cli or (args.keywords and not HAS_TKINTER):
+    # 1. Headless CLI mode
+    if args.cli or (args.keywords and not (HAS_FLASK or HAS_TKINTER)):
         if not args.keywords:
             print("Error: --keywords is required when running in CLI mode.")
             sys.exit(1)
@@ -3519,8 +4093,8 @@ def main():
         )
         return
 
-    # GUI mode
-    if HAS_TKINTER:
+    # 2. Classic Tkinter GUI mode (if explicitly requested with --tk)
+    if args.tk and HAS_TKINTER:
         app = ResearchAppDashboard()
         if args.keywords:
             app.ent_keywords.delete(0, "end")
@@ -3532,8 +4106,19 @@ def main():
             app.ent_folder.delete(0, "end")
             app.ent_folder.insert(0, args.folder)
         app.root.mainloop()
+        return
+
+    # 3. Next-Gen Obsidian 4K Modern UI (Default for desktop launcher & interactive use)
+    if HAS_FLASK:
+        run_web_app(
+            port=args.port,
+            open_window=not args.no_browser and not args.web
+        )
+    elif HAS_TKINTER:
+        app = ResearchAppDashboard()
+        app.root.mainloop()
     else:
-        print("Tkinter is not available. Please run with --cli flag or install python3-tk.")
+        print("Neither Flask nor Tkinter is available. Please run with --cli flag.")
 
 if __name__ == "__main__":
     main()

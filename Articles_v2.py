@@ -1,46 +1,38 @@
 """
-Articles_v2.py — Research PDF Downloader  ██ v10 Ultra Pro ██
+Articles_v2.py — Articles Downloader v11 (research literature harvester)
 ================================================================================
 Developed by Kamran Ashraf.
 
-Searches 9 scholarly APIs (no keys required, polite rate-limiting),
-filters papers with a hybrid title+abstract relevance gate (minimum 60% match),
-eliminates cross-disciplinary collisions (e.g. urology vs battery acronyms),
-suppresses errata and conference meeting abstracts,
-ranks papers by journal quartile (Scimago dual-index with abbreviation expansion)
-and citation count, downloads full-text PDFs with stealth session rotation and
-multi-tier cascading fallback (Direct PDF -> Open Access Repos -> Unpaywall ->
-Publisher Scraper -> Sci-Hub), and writes ready-to-import citations
-(.bib, .ris, APA 7th, CSV with relevance %, JSON corpus metadata).
+Searches 9 scholarly APIs in parallel (no keys required; optional keys raise limits),
+filters papers with a hybrid title+abstract relevance gate (default 60% match),
+blocks cross-disciplinary acronym collisions (e.g. urology "LATP" vs battery "LATP"),
+drops errata / meeting abstracts, ranks by SCImago journal quartile + citations,
+downloads open-access full texts through a multi-tier cascade and writes
+ready-to-import citations.
 
-  PHASE 1 — HARVEST (Hybrid Relevance Gate Across 9 Scholarly Engines)
-    1. OpenAlex       — 250 M+ works; abstracts reconstructed, concepts indexed
-    2. Crossref       — 150 M+ works; bibliographic query targeting & DOI resolution
-    3. Europe PMC     — Direct full-text PDFs & PMC open-access repository
-    4. PubMed / PMC   — NCBI E-Utilities API (36 M+ biomedical/materials/energy)
-    5. Semantic Scholar — AI-indexed open-access research papers
-    6. DOAJ           — Directory of Open Access Journals
-    7. arXiv          — STEM preprints with direct PDF streaming
-    8. CORE.ac.uk     — Open repository harvester
-    9. BASE           — Bielefeld Academic Search Engine
+  PHASE 1 — HARVEST (parallel, selectable sources)
+    OpenAlex · Crossref · Europe PMC · PubMed/PMC · Semantic Scholar · DOAJ · arXiv
+    · CORE (needs CORE_API_KEY) · BASE (whitelisted IPs only)
 
-  PHASE 2 — DEDUPLICATE & RANK
-    Multi-tier deduplication (Normalized DOI + Title Hash + URL)
-    -> Scimago Journal Ranking (ISSN + Title + Abbreviation Expansion)
-    -> Configurable Quartile Filtering (Q1+Q2, Q1-Q4, or All)
-    -> Sort by Quartile/Citations, Citation Count, or Publication Year
+  PHASE 2 — DEDUPLICATE, ENRICH & RANK
+    DOI / title-hash / URL de-duplication -> OpenAlex metadata enrichment
+    -> SCImago quartile (ISSN + title + abbreviation expansion)
+    -> quartile filter (Q1+Q2 | Q1-Q4 | all) -> sort (quartile | citations | newest | relevance)
 
-  PHASE 3 — DOWNLOAD (Stealth Session Concurrency, Multi-Tier Fallback)
-    Candidate URLs -> Synthesized Direct PDF -> OA Repos -> Scraper -> Sci-Hub
-    Q1/Q2 -> "Q1_Q2/",  Q3/Q4 / Preprints -> "Q3_Q4/"
+  PHASE 3 — DOWNLOAD (12 workers, per-keyword balancing)
+    Publisher direct-PDF patterns -> harvested OA links -> Unpaywall -> landing-page
+    scraper -> (optional, off by default) Sci-Hub.   Q1/Q2 -> Q1_Q2/, others -> Q3_Q4/
 
   PHASE 4 — CITATIONS & MEMORY
-    references.bib (LaTeX-safe, braced) / references.ris / references_APA.txt (APA 7)
-    results.csv (Excel-friendly UTF-8 BOM with Relevance %) / corpus_metadata.json
-    SQLite history enables fresh vs incremental search per topic
+    references.bib / references.ris / references_APA.txt / results.csv / corpus_metadata.json
+    SQLite history powers incremental mode and the History browser.
 
-  CLI / AUTOMATION:
-    python Articles_v2.py --cli --keywords "zinc air battery" --max 25 --folder ./pdfs --min-relevance 0.60
+  INTERFACES
+    python Articles_v2.py                      # local web app (default, needs Flask)
+    python Articles_v2.py --tk                 # classic Tkinter GUI
+    python Articles_v2.py -k "zinc air battery" -m 25 -o ./pdfs     # headless
+    python Articles_v2.py -k "LATP" --preview  # rank only, no downloads
+    python Articles_v2.py --doi 10.1038/s41586-020-2649-2           # exact papers
 """
 
 from __future__ import annotations
@@ -62,7 +54,7 @@ import ctypes
 import warnings
 
 def enable_high_dpi_awareness():
-    """Enable Windows Per-Monitor High-DPI v2 scaling for razor-sharp 4K/HD rendering."""
+    """Enable Windows Per-Monitor High-DPI v2 scaling for sharp rendering on HiDPI screens."""
     if sys.platform == "win32":
         try:
             ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
@@ -127,12 +119,26 @@ except ImportError:
 #  CONSTANTS & CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
+APP_NAME        = "Articles Downloader"
+APP_VERSION     = "11.0"
+
 MAX_ARTICLES    = 500
 MAX_WORKERS     = 12          # Concurrency: gentle on scholarly APIs
 REQUEST_TIMEOUT = 45          # Timeout for PDFs and slow CDNs
 MAX_REQUESTS_PER_ARTICLE = 10 # Candidate link trials per article
 MAX_BACKOFF_S   = 25          # Maximum back-off sleep time
+MAX_PDF_BYTES   = 120 * 1024 * 1024  # Refuse absurdly large "PDFs" (protects RAM)
 DEFAULT_MIN_RELEVANCE = 0.60  # Default 60% minimum relevance matching
+
+# Contact address sent to OpenAlex / Crossref / Unpaywall "polite pools".
+# Override with the ARTICLES_CONTACT_EMAIL environment variable or --email.
+CONTACT_EMAIL   = os.environ.get("ARTICLES_CONTACT_EMAIL", "chkam.dev@gmail.com")
+# Optional API keys: raise rate limits (Semantic Scholar) or unlock the API (CORE v3).
+S2_API_KEY      = os.environ.get("S2_API_KEY", "")
+CORE_API_KEY    = os.environ.get("CORE_API_KEY", "")
+# Shadow-library fallback is opt-in only (--allow-scihub / web "Advanced" toggle).
+# Check your local law and institutional policy before enabling it.
+ALLOW_SCIHUB_DEFAULT = os.environ.get("ARTICLES_ALLOW_SCIHUB", "").lower() in ("1", "true", "yes")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -148,6 +154,8 @@ SCRIPT_DIR    = Path(__file__).resolve().parent
 SCIMAGO_CACHE = SCRIPT_DIR / "scimago_ranks.csv"
 HISTORY_DB    = SCRIPT_DIR / "research_history.db"
 SCIMAGO_URL   = "https://www.scimagojr.com/journalrank.php?out=xls"
+
+CURRENT_YEAR  = time.localtime().tm_year
 
 def get_default_save_folder() -> Path:
     d_drive = Path("D:/Research_PDFs")
@@ -226,10 +234,12 @@ active_run_id = 0
 lock_run_id = threading.Lock()
 
 class DownloadContext:
-    def __init__(self, run_id: int, target_downloads: int, save_folder: Path):
+    def __init__(self, run_id: int, target_downloads: int, save_folder: Path,
+                 allow_scihub: bool | None = None):
         self.run_id = run_id
         self.target_downloads = target_downloads
         self.save_folder = save_folder
+        self.allow_scihub = ALLOW_SCIHUB_DEFAULT if allow_scihub is None else bool(allow_scihub)
         self.cancellation_event = threading.Event()
         self.successful_downloads = 0
         self.failed_downloads = 0
@@ -411,10 +421,11 @@ def _bib_key(p: Paper, used: set[str]) -> str:
     used.add(key)
     return key
 
-def _format_bibtex_entry(p: Paper) -> str:
+def _format_bibtex_entry(p: Paper, used_keys: set[str] | None = None) -> str:
     """Format an individual Paper object into a complete, pristine BibTeX entry."""
-    key = _bib_key(p, set())
-    lines = [f"@article{{{key},"]
+    key = _bib_key(p, used_keys if used_keys is not None else set())
+    entry_type = "misc" if (p.quartile == "Preprint" or "arxiv" in (p.journal or "").lower()) else "article"
+    lines = [f"@{entry_type}{{{key},"]
     if p.authors:
         lines.append(f"  author  = {{{' and '.join(_escape_bibtex(a) for a in p.authors)}}},")
     lines.append(f"  title   = {{{{{_escape_bibtex(clean_title(p.title))}}}}},")
@@ -423,7 +434,7 @@ def _format_bibtex_entry(p: Paper) -> str:
     if p.year:
         lines.append(f"  year    = {{{p.year}}},")
     if p.doi:
-        lines.append(f"  doi     = {{{p.doi}}},")
+        lines.append(f"  doi     = {{{p.clean_doi()}}},")
     if p.url:
         lines.append(f"  url     = {{{p.url}}},")
     note_parts = []
@@ -437,6 +448,69 @@ def _format_bibtex_entry(p: Paper) -> str:
         lines.append(f"  note    = {{{', '.join(note_parts)}}},")
     lines.append("}")
     return "\n".join(lines)
+
+def format_bibtex(p: Paper, used_keys: set[str] | None = None) -> str:
+    return _format_bibtex_entry(p, used_keys)
+
+def format_ris(p: Paper) -> str:
+    """One RIS record (EndNote / Zotero / Mendeley import format)."""
+    is_preprint = p.quartile == "Preprint" or "arxiv" in (p.journal or "").lower()
+    out = [f"TY  - {'UNPB' if is_preprint else 'JOUR'}"]
+    for a in p.authors:
+        last, initials = _parse_author_name(a)
+        if last:
+            out.append(f"AU  - {last}, {initials}" if initials else f"AU  - {last}")
+    out.append(f"TI  - {clean_title(p.title)}")
+    if p.journal:
+        out.append(f"JO  - {p.journal}")
+    if p.year:
+        out.append(f"PY  - {p.year}")
+    if p.doi:
+        out.append(f"DO  - {p.clean_doi()}")
+    if p.url:
+        out.append(f"UR  - {p.url}")
+    for iss in p.issns[:2]:
+        out.append(f"SN  - {iss}")
+    if p.abstract:
+        abstract_one_line = re.sub(r"\s+", " ", p.abstract).strip()
+        out.append(f"AB  - {abstract_one_line}")
+    if p.pdf_path:
+        out.append(f"L1  - {Path(p.pdf_path).name}")
+    notes = []
+    if p.quartile:
+        notes.append(f"SJR Quartile: {p.quartile}")
+    notes.append(f"Citations: {p.citations}")
+    if p.relevance_score > 0:
+        notes.append(f"Match: {int(p.relevance_score * 100)}%")
+    out.append(f"N1  - {', '.join(notes)}")
+    out.append("ER  - ")
+    return "\n".join(out)
+
+def format_apa(p: Paper) -> str:
+    """APA 7th-edition reference (plain text; journal italics are not representable)."""
+    au = _authors_apa(p.authors) or "Unknown author"
+    yr = f"({p.year})." if p.year else "(n.d.)."
+    title = clean_title(p.title).rstrip()
+    if not title.endswith((".", "?", "!")):
+        title += "."
+    jrn = f" {p.journal}." if p.journal else ""
+    doi = p.clean_doi()
+    link = f" https://doi.org/{doi}" if doi else (f" {p.url}" if p.url else "")
+    return f"{au} {yr} {title}{jrn}{link}".strip()
+
+CITATION_FORMATS = ("bib", "ris", "apa")
+
+def format_citations(papers: list[Paper], fmt: str) -> str:
+    """Render many papers in one citation format ('bib', 'ris' or 'apa')."""
+    fmt = (fmt or "").lower()
+    if fmt == "bib":
+        used: set[str] = set()
+        return "\n\n".join(format_bibtex(p, used) for p in papers) + "\n"
+    if fmt == "ris":
+        return "\n\n".join(format_ris(p) for p in papers) + "\n"
+    if fmt == "apa":
+        return "\n\n".join(format_apa(p) for p in papers) + "\n"
+    raise ValueError(f"Unknown citation format: {fmt}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  RELEVANCE ENGINE & DISCIPLINARY COLLISION GUARD (60% MINIMUM)
@@ -826,42 +900,73 @@ def open_stealth_session(profile: str = "chrome120"):
     s.headers.update(api_headers())
     return s
 
-API_TIMEOUT = 10  # Fast failover timeout for metadata harvest APIs
+API_TIMEOUT = 12  # Fast failover timeout for metadata harvest APIs
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_thread_local = threading.local()
+
+def polite_ua() -> str:
+    """Identifying User-Agent for scholarly metadata APIs (gets the 'polite pool')."""
+    return f"{APP_NAME.replace(' ', '')}/{APP_VERSION} (mailto:{CONTACT_EMAIL})"
+
+def _api_session() -> requests.Session:
+    """One pooled keep-alive session per worker thread (requests.Session is not thread-safe)."""
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _thread_local.session = s
+    return s
 
 def safe_get(url: str, ctx: DownloadContext | None = None, **kwargs) -> requests.Response | None:
+    """GET with retries, exponential back-off on 429/5xx, Retry-After support and cancellation."""
     req_headers = api_headers()
     if "headers" in kwargs:
         req_headers.update(kwargs.pop("headers"))
     timeout_val = kwargs.pop("timeout", API_TIMEOUT)
-    max_retries = kwargs.pop("retries", 2)
+    max_retries = max(1, kwargs.pop("retries", 3))
+    quiet = kwargs.pop("quiet", False)
 
     for attempt in range(1, max_retries + 1):
         if is_cancelled(ctx):
             return None
         try:
-            r = requests.get(url, headers=req_headers,
-                             timeout=timeout_val,
-                             proxies=rand_proxy(), **kwargs)
-            if r.status_code == 429:
-                retry_header = r.headers.get("Retry-After")
-                if retry_header and retry_header.isdigit():
+            r = _api_session().get(url, headers=req_headers, timeout=timeout_val,
+                                   proxies=rand_proxy(), **kwargs)
+            if r.status_code in _RETRYABLE_STATUS and attempt < max_retries:
+                retry_header = (r.headers.get("Retry-After") or "").strip()
+                if retry_header.isdigit():
                     wait = min(float(retry_header), 10.0)
                 else:
-                    wait = min(2 ** attempt + random.uniform(0.5, 1.5), 6.0)
-                _log(f"    ⏳ Rate limited (429). Waiting {wait:.1f}s...")
+                    wait = min(2 ** attempt + random.uniform(0.3, 1.0), 8.0)
+                if not quiet:
+                    host = urlparse(url).netloc
+                    _log(f"    ⏳ {host} answered HTTP {r.status_code}; retrying in {wait:.1f}s…")
                 if sleep_check_cancel(wait, ctx):
                     return None
                 continue
             return r
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            _log(f"    ⏱ {type(e).__name__} (attempt {attempt}/{max_retries}): {url[:60]}")
-            if attempt < max_retries:
-                if sleep_check_cancel(1.0, ctx):
-                    return None
+            if not quiet:
+                _log(f"    ⏱ {type(e).__name__} (attempt {attempt}/{max_retries}): {url[:60]}")
+            if attempt < max_retries and sleep_check_cancel(1.0 * attempt, ctx):
+                return None
         except Exception as e:
-            _log(f"    ⚠️  Request error: {e}")
+            if not quiet:
+                _log(f"    ⚠️  Request error: {e}")
             break
     return None
+
+def safe_json(r: requests.Response | None) -> dict:
+    """Decode a JSON body defensively (APIs sometimes send HTML error pages with 200)."""
+    if r is None:
+        return {}
+    try:
+        data = r.json()
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        return {}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SCIMAGO JOURNAL QUARTILE RANKING (ISSN + TITLE + ABBREVIATION DUAL INDEX)
@@ -893,7 +998,11 @@ JOURNAL_ABBREV_MAP = {
 }
 
 def _norm_issn(s: str) -> str:
-    return re.sub(r"[^0-9Xx]", "", s or "").upper().zfill(8)
+    """Normalise an ISSN to 8 chars; returns "" for blanks/garbage (never '00000000')."""
+    digits = re.sub(r"[^0-9Xx]", "", s or "").upper()
+    if not digits or len(digits) > 8 or not digits.strip("0"):
+        return ""
+    return digits.zfill(8)
 
 JOURNAL_CONNECTOR_STOPWORDS = {"and", "of", "the", "for", "in", "on", "to", "with", "a", "an"}
 
@@ -985,14 +1094,13 @@ def load_scimago_quartiles() -> tuple[dict[str, str], dict[str, str]]:
         return _scimago_issn_map, _scimago_title_map
 
 def quartile_for(issns: list[str], journal: str = "") -> str:
-    global _scimago_issn_map, _scimago_title_map
     if _scimago_issn_map is None or _scimago_title_map is None:
         load_scimago_quartiles()
     issn_map, title_map = _scimago_issn_map or {}, _scimago_title_map or {}
     # Primary: check ISSN
     for iss in issns:
         ni = _norm_issn(iss)
-        if ni in issn_map:
+        if ni and ni in issn_map:
             return issn_map[ni]
     # Fallback: check normalized journal title and variants
     if journal:
@@ -1048,13 +1156,13 @@ def harvest_openalex(keywords: str, y1: str, y2: str, max_res: int = 250, ctx=No
             "per-page": per_page,
             "cursor": cursor,
             "select": "id,doi,title,authorships,publication_year,cited_by_count,primary_location,best_oa_location,locations,open_access,abstract_inverted_index,concepts,type",
-            "mailto": "chkam.dev@gmail.com",
+            "mailto": CONTACT_EMAIL,
         }
-        r = safe_get(base, ctx=ctx, params=params, headers={"User-Agent": "ResearchLiteratureHarvester/10.0 (mailto:chkam.dev@gmail.com)"})
+        r = safe_get(base, ctx=ctx, params=params, headers={"User-Agent": polite_ua()})
         if r is None or r.status_code != 200:
             break
-        data = r.json()
-        results = data.get("results", [])
+        data = safe_json(r)
+        results = data.get("results") or []
         if not results:
             break
 
@@ -1137,12 +1245,12 @@ def harvest_crossref(keywords: str, y1: str, y2: str, max_res: int = 250, ctx=No
             "rows": rows,
             "cursor": cursor,
             "select": "DOI,title,author,container-title,ISSN,published,published-print,published-online,is-referenced-by-count,link,resource,type",
-            "mailto": "chkam.dev@gmail.com",
+            "mailto": CONTACT_EMAIL,
         }
         r = safe_get(base, ctx=ctx, params=params)
         if r is None or r.status_code != 200:
             break
-        msg = r.json().get("message", {})
+        msg = safe_json(r).get("message") or {}
         items = msg.get("items", [])
         if not items:
             break
@@ -1216,7 +1324,8 @@ def harvest_europepmc(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=N
         r = safe_get(base, ctx=ctx, params=params)
         if r is None or r.status_code != 200:
             break
-        results = r.json().get("resultList", {}).get("result", [])
+        body = safe_json(r)
+        results = (body.get("resultList") or {}).get("result") or []
         if not results:
             break
 
@@ -1263,7 +1372,7 @@ def harvest_europepmc(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=N
                       source="EuropePMC")
             add_paper_candidate(found, p)
 
-        cursor = r.json().get("nextCursorMark", "")
+        cursor = body.get("nextCursorMark", "")
         if not cursor or cursor == "*" or len(results) < page_size:
             break
         jitter(0.2, 0.4)
@@ -1282,11 +1391,12 @@ def harvest_pubmed(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=None
     query = f"({keywords}) AND ({y1}/01/01[pdat] : {y2}/12/31[pdat])"
     r = safe_get(base_search, ctx=ctx, params={
         "db": "pmc", "term": query, "retmode": "json", "retmax": min(max_res, 100),
+        "tool": "ArticlesDownloader", "email": CONTACT_EMAIL,
     })
     if r is None or r.status_code != 200:
         return found
 
-    id_list = r.json().get("esearchresult", {}).get("idlist", [])
+    id_list = (safe_json(r).get("esearchresult") or {}).get("idlist") or []
     if not id_list:
         return found
 
@@ -1297,10 +1407,11 @@ def harvest_pubmed(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=None
         batch = id_list[i:i + 50]
         r_sum = safe_get(base_summary, ctx=ctx, params={
             "db": "pmc", "id": ",".join(batch), "retmode": "json",
+            "tool": "ArticlesDownloader", "email": CONTACT_EMAIL,
         })
         if r_sum is None or r_sum.status_code != 200:
             continue
-        res_data = r_sum.json().get("result", {})
+        res_data = safe_json(r_sum).get("result") or {}
 
         for pid in batch:
             item = res_data.get(pid, {})
@@ -1310,7 +1421,13 @@ def harvest_pubmed(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=None
             if not is_rel:
                 continue
 
-            doi = _extract_doi(item.get("doi") or "") or item.get("doi") or ""
+            # PMC esummary keeps the DOI inside "articleids" (older responses used "doi").
+            doi = _extract_doi(item.get("doi") or "")
+            if not doi:
+                for aid in item.get("articleids") or []:
+                    if str(aid.get("idtype", "")).lower() == "doi":
+                        doi = _extract_doi(aid.get("value") or "")
+                        break
             authors = [a.get("name") for a in item.get("authors", []) if a.get("name")]
             journal = item.get("source") or item.get("fulljournalname") or ""
             pubdate = item.get("pubdate") or ""
@@ -1337,20 +1454,17 @@ def harvest_semantic_scholar(keywords: str, y1: str, y2: str, max_res: int = 150
     base = "https://api.semanticscholar.org/graph/v1/paper/search"
     limit = min(50, max_res)
 
-    try:
-        r = requests.get(base, headers=api_headers(), params={
-            "query": keywords,
-            "fields": "title,openAccessPdf,year,authors,venue,citationCount,externalIds,abstract",
-            "limit": limit, "offset": 0, "year": f"{y1}-{y2}",
-        }, timeout=15)
-        if r.status_code == 429:
-            _log("    ⏳ Semantic Scholar rate-limited; continuing with remaining harvesters.")
-            return found
-        if r.status_code != 200:
-            return found
-        items = r.json().get("data", [])
-    except Exception:
+    headers = {"x-api-key": S2_API_KEY} if S2_API_KEY else {}
+    r = safe_get(base, ctx=ctx, headers=headers, timeout=15, retries=2, params={
+        "query": keywords,
+        "fields": "title,openAccessPdf,year,authors,venue,citationCount,externalIds,abstract",
+        "limit": limit, "offset": 0, "year": f"{y1}-{y2}",
+    })
+    if r is None or r.status_code != 200:
+        if r is not None and r.status_code == 429:
+            _log("    ⏳ Semantic Scholar rate-limited (set S2_API_KEY for higher limits); continuing.")
         return found
+    items = safe_json(r).get("data") or []
 
     for paper in items:
         title = clean_title(paper.get("title") or "")
@@ -1397,7 +1511,7 @@ def harvest_doaj(keywords: str, y1: str, y2: str, max_res: int = 100, ctx=None,
         })
         if r is None or r.status_code != 200:
             break
-        results = r.json().get("results", [])
+        results = safe_json(r).get("results") or []
         if not results:
             break
 
@@ -1458,12 +1572,18 @@ def harvest_arxiv(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=None,
     page = 0
     ns = {"atom": "http://www.w3.org/2005/Atom"}
 
+    # arXiv treats bare spaces loosely; AND every term and filter dates server-side.
+    terms = [t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", keywords)
+             if t.lower() not in RELEVANCE_STOPWORDS] or [keywords.strip()]
+    search_query = " AND ".join(f"all:{t}" for t in terms[:8])
+    search_query += f" AND submittedDate:[{y1}01010000 TO {y2}12312359]"
+
     while len(found) < max_res and not is_cancelled(ctx) and page < 3:
         page += 1
         r = safe_get(base, ctx=ctx, params={
-            "search_query": f"all:{keywords}",
+            "search_query": search_query,
             "start": start, "max_results": batch,
-            "sortBy": "submittedDate", "sortOrder": "descending",
+            "sortBy": "relevance", "sortOrder": "descending",
         })
         if r is None or r.status_code != 200:
             break
@@ -1525,19 +1645,16 @@ def harvest_core(keywords: str, y1: str, y2: str, max_res: int = 100, ctx=None,
     base = "https://api.core.ac.uk/v3/search/works"
     size = min(100, max_res)
 
-    try:
-        r = requests.get(base, headers=api_headers(), params={
-            "q": f"{keywords} year:[{y1} TO {y2}]",
-            "limit": size, "offset": 0, "exclude": "fullText",
-        }, timeout=12)
-        if r.status_code in (401, 403, 429):
-            _log("    ⏳ CORE API busy or unauthenticated; continuing.")
-            return found
-        if r.status_code != 200:
-            return found
-        results = r.json().get("results", [])
-    except Exception:
+    headers = {"Authorization": f"Bearer {CORE_API_KEY}"} if CORE_API_KEY else {}
+    r = safe_get(base, ctx=ctx, headers=headers, retries=2, params={
+        "q": f"({keywords}) AND yearPublished>={y1} AND yearPublished<={y2}",
+        "limit": size, "offset": 0, "exclude": "fullText",
+    })
+    if r is None or r.status_code != 200:
+        if r is not None and r.status_code in (401, 403):
+            _log("    ⏳ CORE needs a free API key (set CORE_API_KEY); skipping.")
         return found
+    results = safe_json(r).get("results") or []
 
     for item in results:
         title = clean_title(item.get("title") or "")
@@ -1575,16 +1692,14 @@ def harvest_base(keywords: str, y1: str, y2: str, max_res: int = 100, ctx=None,
     base = "https://api.base-search.net/cgi-bin/BaseHttpSearchInterface.fcgi"
     hits = min(100, max_res)
 
-    try:
-        r = requests.get(base, headers=api_headers(), params={
-            "func": "PerformSearch", "query": keywords, "format": "json",
-            "hits": hits, "offset": 0,
-        }, timeout=12)
-        if r.status_code != 200:
-            return found
-        docs = (r.json().get("response", {}) or {}).get("docs", [])
-    except Exception:
+    # BASE only answers whitelisted IPs; fail fast and quietly otherwise.
+    r = safe_get(base, ctx=ctx, retries=1, quiet=True, params={
+        "func": "PerformSearch", "query": keywords, "format": "json",
+        "hits": hits, "offset": 0,
+    })
+    if r is None or r.status_code != 200:
         return found
+    docs = (safe_json(r).get("response") or {}).get("docs") or []
 
     for d in docs:
         title = clean_title(d.get("dctitle") or "")
@@ -1655,7 +1770,7 @@ def enrich_with_openalex(papers: list[Paper], ctx: DownloadContext | None = None
             "filter": "doi:" + "|".join(batch),
             "per-page": 50,
             "select": "doi,title,authorships,publication_year,cited_by_count,primary_location,locations,abstract_inverted_index,concepts",
-            "mailto": "chkam.dev@gmail.com",
+            "mailto": CONTACT_EMAIL,
         })
         if r is None or r.status_code != 200:
             failed_batches += 1
@@ -1820,13 +1935,10 @@ def _fetch_unpaywall_mirrors(doi: str) -> list[str]:
         return []
     urls = []
     try:
-        r = requests.get(
-            f"https://api.unpaywall.org/v2/{doi}",
-            params={"email": "chkam.dev@gmail.com"},
-            headers=api_headers(), timeout=10,
-        )
-        if r.status_code == 200:
-            data = r.json()
+        r = safe_get(f"https://api.unpaywall.org/v2/{quote(doi, safe='/')}",
+                     params={"email": CONTACT_EMAIL}, timeout=10, retries=2, quiet=True)
+        if r is not None and r.status_code == 200:
+            data = safe_json(r)
             best_loc = data.get("best_oa_location") or {}
             for key in ["url_for_pdf", "url", "url_for_landing_page"]:
                 u = best_loc.get(key)
@@ -1893,16 +2005,13 @@ def _fetch_scihub_mirrors(doi: str) -> list[str]:
     return []
 
 def _scrape_pdf_from_html(html_text: str, base_url: str) -> str:
-    blocked_substrings = [
-        "citation", "ris", "bibtex", "share", "facebook", "twitter",
-        "linkedin", "login", "register", "subscribe", "metrics", "history", "epdf"
-    ]
+    # Word-bounded so that e.g. "paris" / "iris" / "chris" hosts are not rejected as "ris".
+    blocked = re.compile(
+        r"(citation|bibtex|[/.=]ris\b|share|facebook|twitter|linkedin|login|register"
+        r"|subscribe|metrics|/epdf\b)", re.I)
 
     def is_valid(u: str) -> bool:
-        if not _is_real_http_url(u):
-            return False
-        ul = u.lower()
-        return not any(sub in ul for sub in blocked_substrings)
+        return _is_real_http_url(u) and not blocked.search(u)
 
     if HAS_BS4:
         soup = BeautifulSoup(html_text, "html.parser")
@@ -1943,6 +2052,27 @@ def _scrape_pdf_from_html(html_text: str, base_url: str) -> str:
             return candidate
     return ""
 
+def _looks_like_pdf(content: bytes) -> bool:
+    """A real PDF starts with the %PDF- magic (some servers prepend a BOM/whitespace)."""
+    return b"%PDF-" in content[:1024]
+
+def _is_tls_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(k in text for k in ("ssl", "certificate", "tls handshake"))
+
+def _fetch_document(url: str, profile: str, ctx: DownloadContext | None):
+    """Fetch a candidate URL with TLS verification; fall back to unverified TLS only
+    for hosts with broken certificate chains (common on university repositories)."""
+    with open_stealth_session(profile) as session:
+        try:
+            return session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        except Exception as exc:
+            if not _is_tls_error(exc) or is_cancelled(ctx):
+                raise
+            _log(f"    🔐 TLS verification failed for {urlparse(url).netloc}; retrying without it",
+                 run_id=ctx.run_id if ctx else None)
+            return session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True, verify=False)
+
 _path_lock = threading.Lock()
 
 def _make_path(folder: Path, title: str, ext: str) -> Path:
@@ -1972,7 +2102,7 @@ def download_article(data: tuple) -> dict:
             return result
 
     tried_unpaywall = False
-    tried_scihub = False
+    tried_scihub = not ctx.allow_scihub   # opt-in only: pretend it was already tried
     raw_candidates = []
 
     # 1. Synthesize publisher direct PDF endpoints
@@ -2036,28 +2166,24 @@ def download_article(data: tuple) -> dict:
         profile = IMPERSONATE_PROFILES[total_requests % len(IMPERSONATE_PROFILES)]
 
         try:
-            with open_stealth_session(profile) as session:
-                resp = session.get(
-                    current_url,
-                    timeout=REQUEST_TIMEOUT,
-                    allow_redirects=True,
-                    verify=False,
-                )
+            resp = _fetch_document(current_url, profile, ctx)
 
             ct = resp.headers.get("Content-Type", "").lower()
-            final_url = resp.url
+            final_url = str(resp.url)
 
             if resp.status_code != 200:
                 raise ValueError(f"HTTP {resp.status_code}")
 
             resp_content = resp.content
             content_size = len(resp_content)
-            actual_pdf = b"%PDF" in resp_content[:1024]
+            actual_pdf = _looks_like_pdf(resp_content)
 
             # Case 1: Got Valid Full-Text PDF
             if actual_pdf:
                 if content_size < 8192:
                     raise ValueError(f"PDF too small ({content_size} bytes)")
+                if content_size > MAX_PDF_BYTES:
+                    raise ValueError(f"PDF too large ({content_size // (1024 * 1024)} MB)")
 
                 with ctx.lock:
                     if ctx._at_capacity(keyword):
@@ -2192,67 +2318,11 @@ def write_bibliography(papers: list[Paper], folder: Path):
     if not papers:
         return
     papers.sort(key=lambda p: (p.quartile or "Q9", -p.citations))
-    used_keys: set[str] = set()
 
-    # 1. BibTeX (references.bib)
-    with open(folder / "references.bib", "w", encoding="utf-8") as f:
-        for p in papers:
-            key = _bib_key(p, used_keys)
-            f.write(f"@article{{{key},\n")
-            if p.authors:
-                f.write(f"  author  = {{{' and '.join(_escape_bibtex(a) for a in p.authors)}}},\n")
-            f.write(f"  title   = {{{{{_escape_bibtex(clean_title(p.title))}}}}},\n")
-            if p.journal:
-                f.write(f"  journal = {{{_escape_bibtex(p.journal)}}},\n")
-            if p.year:
-                f.write(f"  year    = {{{p.year}}},\n")
-            if p.doi:
-                f.write(f"  doi     = {{{p.doi}}},\n")
-            if p.url:
-                f.write(f"  url     = {{{p.url}}},\n")
-            note_parts = []
-            if p.quartile:
-                note_parts.append(p.quartile)
-            if p.citations:
-                note_parts.append(f"cited-by: {p.citations}")
-            if p.relevance_score > 0:
-                note_parts.append(f"relevance: {int(p.relevance_score * 100)}%")
-            if note_parts:
-                f.write(f"  note    = {{{', '.join(note_parts)}}},\n")
-            f.write("}\n\n")
-
-    # 2. RIS (references.ris)
-    with open(folder / "references.ris", "w", encoding="utf-8") as f:
-        for p in papers:
-            f.write("TY  - JOUR\n")
-            for a in p.authors:
-                last, initials = _parse_author_name(a)
-                f.write(f"AU  - {last}, {initials}\n" if initials else f"AU  - {last}\n")
-            f.write(f"TI  - {clean_title(p.title)}\n")
-            if p.journal:
-                f.write(f"JO  - {p.journal}\n")
-            if p.year:
-                f.write(f"PY  - {p.year}\n")
-            if p.doi:
-                f.write(f"DO  - {p.doi}\n")
-            if p.url:
-                f.write(f"UR  - {p.url}\n")
-            if p.pdf_path:
-                f.write(f"L1  - {Path(p.pdf_path).name}\n")
-            rel_str = f", Match: {int(p.relevance_score * 100)}%" if p.relevance_score > 0 else ""
-            if p.quartile:
-                f.write(f"N1  - SJR Quartile: {p.quartile}, Citations: {p.citations}{rel_str}\n")
-            f.write("ER  - \n\n")
-
-    # 3. APA 7th Edition (references_APA.txt)
-    with open(folder / "references_APA.txt", "w", encoding="utf-8") as f:
-        for p in papers:
-            au = _authors_apa(p.authors)
-            yr = f"({p.year})." if p.year else "(n.d.)."
-            title = clean_title(p.title)
-            jrn = f" {p.journal}." if p.journal else ""
-            doi = f" https://doi.org/{p.doi}" if p.doi else (f" {p.url}" if p.url else "")
-            f.write(f"{au} {yr} {title}.{jrn}{doi}\n\n".strip() + "\n\n")
+    # 1-3. BibTeX, RIS and APA 7 share the single set of tested formatters
+    (folder / "references.bib").write_text(format_citations(papers, "bib"), encoding="utf-8")
+    (folder / "references.ris").write_text(format_citations(papers, "ris"), encoding="utf-8")
+    (folder / "references_APA.txt").write_text(format_citations(papers, "apa"), encoding="utf-8")
 
     # 4. CSV Spreadsheet (results.csv with UTF-8 BOM for Excel)
     with open(folder / "results.csv", "w", encoding="utf-8-sig", newline="") as f:
@@ -2302,6 +2372,12 @@ def write_bibliography(papers: list[Paper], folder: Path):
 #  SQLITE HISTORY & TOPIC MEMORY
 # ══════════════════════════════════════════════════════════════════════════════
 
+_HISTORY_EXTRA_COLS = [
+    ("identifier", "TEXT"), ("year", "TEXT"), ("journal", "TEXT"), ("citations", "INTEGER"),
+    ("filename", "TEXT"), ("doi", "TEXT"), ("authors", "TEXT"), ("pdf_path", "TEXT"),
+    ("url", "TEXT"), ("source", "TEXT"), ("relevance", "REAL"),
+]
+
 def _history_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(HISTORY_DB), timeout=30.0)
     try:
@@ -2324,21 +2400,28 @@ def _history_conn() -> sqlite3.Connection:
         )
     """)
     try:
-        cursor = conn.execute("PRAGMA table_info(history)")
-        existing_cols = {row[1] for row in cursor.fetchall()}
-        for col, col_type in [("identifier", "TEXT"), ("year", "TEXT"), ("journal", "TEXT"),
-                              ("citations", "INTEGER"), ("filename", "TEXT")]:
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(history)").fetchall()}
+        for col, col_type in _HISTORY_EXTRA_COLS:
             if col not in existing_cols:
                 try:
                     conn.execute(f"ALTER TABLE history ADD COLUMN {col} {col_type}")
                 except Exception:
                     pass
-        if "identifier" in existing_cols and "doi" in existing_cols:
-            conn.execute("UPDATE history SET identifier = doi WHERE identifier IS NULL OR identifier = ''")
-            conn.commit()
+        conn.commit()
     except Exception:
         pass
     return conn
+
+def normalize_query(keywords: str, focus: str = "") -> str:
+    """Canonical history key: keywords + focus words, de-duplicated, lower-case.
+
+    Shared by the workflow, the GUIs and the web API so that "searched before?"
+    checks and incremental mode always look at the same history bucket."""
+    words: list[str] = []
+    for w in f"{keywords or ''} {focus or ''}".split():
+        if w.lower() not in (x.lower() for x in words):
+            words.append(w)
+    return " ".join(words).lower()
 
 def query_seen_count(query_norm: str) -> int:
     try:
@@ -2354,87 +2437,215 @@ def history_identifiers(query_norm: str) -> set[str]:
         conn = _history_conn()
         rows = conn.execute("SELECT identifier FROM history WHERE query=?", (query_norm,)).fetchall()
         conn.close()
-        return {r[0] for r in rows if r[0]}
+        return {r[0].lower() for r in rows if r[0]}
     except Exception:
         return set()
+
+def _paper_identifier(p: Paper) -> str:
+    return (p.clean_doi() or p.title_hash()).lower()
 
 def record_history(query_norm: str, papers: list[Paper]):
     try:
         conn = _history_conn()
-        today = time.strftime("%Y-%m-%d")
+        today = time.strftime("%Y-%m-%d %H:%M")
         for p in papers:
             if p.pdf_path:
-                ident = p.clean_doi() or p.title_hash()
                 conn.execute(
                     """INSERT OR REPLACE INTO history
-                       (query, identifier, title, quartile, year, journal, citations, filename, date)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (query_norm, ident, clean_title(p.title)[:200], p.quartile,
-                     p.year, p.journal[:100], p.citations, Path(p.pdf_path).name, today)
+                       (query, identifier, title, quartile, year, journal, citations, filename, date,
+                        doi, authors, pdf_path, url, source, relevance)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (query_norm, _paper_identifier(p), clean_title(p.title)[:300], p.quartile,
+                     p.year, (p.journal or "")[:200], p.citations, Path(p.pdf_path).name, today,
+                     p.clean_doi(), json.dumps(p.authors[:25], ensure_ascii=False), p.pdf_path,
+                     p.url, p.source, round(p.relevance_score, 3))
                 )
         conn.commit()
         conn.close()
     except Exception as e:
         _log(f"  ⚠️  History save error: {e}")
 
+def history_topics(search: str = "", limit: int = 60) -> list[dict]:
+    """Past topics with paper counts, newest first; optional substring filter on topic/titles."""
+    try:
+        conn = _history_conn()
+        sql = """SELECT query, COUNT(DISTINCT identifier), MAX(date),
+                        SUM(CASE WHEN quartile IN ('Q1','Q2') THEN 1 ELSE 0 END)
+                 FROM history WHERE query IS NOT NULL AND query != ''"""
+        args: list = []
+        if search.strip():
+            sql += " AND (query LIKE ? OR title LIKE ?)"
+            like = f"%{search.strip()}%"
+            args += [like, like]
+        sql += " GROUP BY query ORDER BY MAX(date) DESC LIMIT ?"
+        args.append(int(limit))
+        rows = conn.execute(sql, args).fetchall()
+        conn.close()
+        return [{"query": r[0], "count": r[1], "date": r[2] or "", "high_impact": r[3] or 0}
+                for r in rows]
+    except Exception:
+        return []
+
+def history_papers(query_norm: str) -> list[dict]:
+    """Every paper recorded for one topic (for the History browser)."""
+    try:
+        conn = _history_conn()
+        rows = conn.execute(
+            """SELECT identifier, title, quartile, year, journal, citations, filename, date,
+                      doi, authors, pdf_path, url, source, relevance
+               FROM history WHERE query=? ORDER BY date DESC, citations DESC""", (query_norm,)
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        try:
+            authors = json.loads(r[9]) if r[9] else []
+        except ValueError:
+            authors = []
+        out.append({
+            "id": r[0], "title": r[1] or "", "quartile": r[2] or "Unranked", "year": r[3] or "",
+            "journal": r[4] or "", "citations": r[5] or 0, "filename": r[6] or "", "date": r[7] or "",
+            "doi": r[8] or (r[0] if (r[0] or "").startswith("10.") else ""), "authors": authors,
+            "pdf_path": r[10] or "", "url": r[11] or "", "source": r[12] or "",
+            "relevance_score": r[13] or 0.0,
+            "exists": bool(r[10]) and os.path.exists(r[10]),
+        })
+    return out
+
+def delete_history(query_norm: str) -> int:
+    """Forget one topic (does not touch any PDF on disk)."""
+    try:
+        conn = _history_conn()
+        n = conn.execute("DELETE FROM history WHERE query=?", (query_norm,)).rowcount
+        conn.commit()
+        conn.close()
+        return n
+    except Exception:
+        return 0
+
+def history_download_roots() -> set[Path]:
+    """Folders that hold PDFs recorded in history (used to authorise file serving)."""
+    roots: set[Path] = set()
+    try:
+        conn = _history_conn()
+        for (pp,) in conn.execute("SELECT DISTINCT pdf_path FROM history WHERE pdf_path IS NOT NULL"):
+            if pp:
+                roots.add(Path(pp).resolve().parent)
+        conn.close()
+    except Exception:
+        pass
+    return roots
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CORE WORKFLOW ENGINE (HEADLESS & GUI REUSABLE)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def execute_research_workflow(
-    keywords: str,
-    focus: str = "",
-    year_start: str = "2023",
-    year_end: str = "2026",
-    max_articles: int = 50,
-    save_folder: Path | str = "",
-    quartile_filter: str = "all_ranked",  # 'q1_q2', 'all_ranked', 'all'
-    sort_strategy: str = "quartile_cits",  # 'quartile_cits', 'citations', 'newest'
-    mode: str = "fresh",
-    min_relevance: float = DEFAULT_MIN_RELEVANCE,
-    ctx: DownloadContext | None = None,
-    progress_callback=None,
-    status_callback=None,
-    paper_callback=None,
-) -> list[Paper]:
-    """Autonomous execution of literature harvest, ranking, download and citations."""
-    global log_file_path
+# ── Harvester registry ────────────────────────────────────────────────────────
+# key -> (display name, function, per-query result cap)
+HARVESTER_REGISTRY: dict[str, tuple] = {
+    "openalex":         ("OpenAlex",         harvest_openalex,         200),
+    "crossref":         ("Crossref",         harvest_crossref,         250),
+    "europepmc":        ("Europe PMC",       harvest_europepmc,        150),
+    "pubmed":           ("PubMed/PMC",       harvest_pubmed,           150),
+    "semanticscholar":  ("Semantic Scholar", harvest_semantic_scholar, 100),
+    "doaj":             ("DOAJ",             harvest_doaj,             100),
+    "arxiv":            ("arXiv",            harvest_arxiv,            100),
+    "core":             ("CORE",             harvest_core,             100),
+    "base":             ("BASE",             harvest_base,             100),
+}
+ALL_SOURCES = list(HARVESTER_REGISTRY)
+QUARTILE_FILTERS = ("q1_q2", "all_ranked", "all")
+SORT_STRATEGIES = ("quartile_cits", "citations", "newest", "relevance")
 
-    folder = Path(save_folder) if save_folder else get_default_save_folder()
-    q_hi = folder / "Q1_Q2"
-    q_lo = folder / "Q3_Q4"
-    for d in (folder, q_hi, q_lo):
+def resolve_sources(sources) -> list[str]:
+    """Validate a user-supplied source list (names or keys); empty/None means all."""
+    if not sources:
+        return list(ALL_SOURCES)
+    if isinstance(sources, str):
+        sources = [s for s in re.split(r"[,;]+", sources) if s.strip()]
+    by_name = {v[0].lower().replace(" ", ""): k for k, v in HARVESTER_REGISTRY.items()}
+
+    def _key(token: str) -> str:
+        k = token.lower().replace(" ", "").replace("_", "").replace("-", "")
+        return k if k in HARVESTER_REGISTRY else by_name.get(k, "")
+
+    out: list[str] = []
+    for s in sources:
+        # "Semantic Scholar" is one source; "arxiv openalex" is two.
+        keys = [_key(str(s))] if _key(str(s)) else [_key(t) for t in str(s).split()]
+        for k in keys:
+            if k and k not in out:
+                out.append(k)
+    return out or list(ALL_SOURCES)
+
+def rank_papers(papers: list[Paper], sort_strategy: str = "quartile_cits") -> list[Paper]:
+    """Sort in place and return the list (stable, deterministic ordering)."""
+    if sort_strategy == "citations":
+        papers.sort(key=lambda p: (-p.citations, -p.relevance_score))
+    elif sort_strategy == "newest":
+        papers.sort(key=lambda p: (-(int(p.year) if str(p.year).isdigit() else 0), -p.citations))
+    elif sort_strategy == "relevance":
+        papers.sort(key=lambda p: (-p.relevance_score, -p.citations))
+    else:  # 'quartile_cits'
+        q_order = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4, "Preprint": 5, "Unranked": 6, "": 7}
+        papers.sort(key=lambda p: (q_order.get(p.quartile, 9), -p.citations, -p.relevance_score))
+    return papers
+
+def _begin_run(folder: Path, ctx: DownloadContext | None) -> int:
+    """Prepare shared per-run state (log file, dedup sets, active run id)."""
+    global log_file_path, active_run_id
+    for d in (folder, folder / "Q1_Q2", folder / "Q3_Q4"):
         d.mkdir(parents=True, exist_ok=True)
-
     log_file_path = folder / "research_download.log"
     with lock_seen:
         seen_urls.clear()
         seen_dois.clear()
         seen_titles.clear()
-
     run_id = ctx.run_id if ctx else 1
-    global active_run_id
     with lock_run_id:
         active_run_id = run_id
+    return run_id
 
-    # Deduplicate terms between keywords and focus
-    kw_words = keywords.strip().split()
-    foc_words = focus.strip().split()
-    dedup_words = []
-    for w in kw_words + foc_words:
-        if w.lower() not in [x.lower() for x in dedup_words]:
-            dedup_words.append(w)
-    combined_query = " ".join(dedup_words)
-    query_norm = combined_query.lower()
+def _emit(cb, *args):
+    if cb:
+        try:
+            cb(*args)
+        except Exception:
+            pass
 
-    if status_callback:
-        status_callback("Phase 1: Searching scholarly databases…", "#58a6ff")
-    _log(f"\n{'═'*65}", run_id=run_id)
-    _log("  🚀 RESEARCH PDF DOWNLOADER — v10 Ultra Pro", run_id=run_id)
-    _log(f"  Query: {keywords} | Focus: {focus or 'None'} | Years: {year_start}-{year_end}", run_id=run_id)
-    _log(f"  Target: {max_articles} PDFs | Filter: {quartile_filter} | Min Match: {int(min_relevance*100)}%", run_id=run_id)
-    _log(f"  Folder: {folder}", run_id=run_id)
-    _log(f"{'═'*65}\n", run_id=run_id)
+def harvest_and_rank(
+    keywords: str,
+    focus: str = "",
+    year_start: str = "2023",
+    year_end: str = "2026",
+    max_articles: int = 50,
+    quartile_filter: str = "all_ranked",
+    sort_strategy: str = "quartile_cits",
+    mode: str = "fresh",
+    min_relevance: float = DEFAULT_MIN_RELEVANCE,
+    ctx: DownloadContext | None = None,
+    sources=None,
+    status_callback=None,
+    phase_callback=None,
+) -> list[Paper]:
+    """PHASE 1 + 2: query the selected scholarly sources in parallel, then enrich,
+    rank by journal quartile and filter.  Returns the ranked candidate pool.
+
+    When the keywords are a long title, it is split into keyword groups and each
+    paper gets ``paper.keyword`` set so downloads can be balanced per group
+    (``ctx.kw_targets``)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    run_id = ctx.run_id if ctx else 1
+    srcs = resolve_sources(sources)
+    query_norm = normalize_query(keywords, focus)
+
+    _emit(phase_callback, "harvesting")
+    _emit(status_callback, "Phase 1: Searching scholarly databases…", "#58a6ff")
+    names = ", ".join(HARVESTER_REGISTRY[k][0] for k in srcs)
+    _log(f"  Sources ({len(srcs)}): {names}", run_id=run_id)
 
     # ── Long-title keyword splitter & focus normalization ─────────────────────
     norm_kw = " ".join(re.findall(r"[A-Za-z0-9]+", keywords.lower()))
@@ -2461,52 +2672,45 @@ def execute_research_workflow(
         for lbl, _, sh in groups:
             _log(f"     • {lbl}  →  {sh} article(s)", run_id=run_id)
     else:
-        groups = [(keywords, combined_query, max_articles)]
+        groups = [(keywords, normalize_query(keywords, effective_focus) if effective_focus else keywords,
+                   max_articles)]
 
-    # ── PHASE 1: Harvest ──────────────────────────────────────────────────────
+    # ── PHASE 1: Harvest (all selected sources in parallel per keyword group) ──
     papers: list[Paper] = []
     pool_size = max(max_articles * 4, min(max_articles * 8, 200))
-
-    HARVESTERS = [
-        ("OpenAlex",         harvest_openalex,         max(200, pool_size)),
-        ("Crossref",         harvest_crossref,         250),
-        ("Europe PMC",       harvest_europepmc,        150),
-        ("PubMed/PMC",       harvest_pubmed,           150),
-        ("Semantic Scholar", harvest_semantic_scholar, 100),
-        ("DOAJ",             harvest_doaj,             100),
-        ("arXiv",            harvest_arxiv,            100),
-        ("CORE",             harvest_core,             100),
-        ("BASE",             harvest_base,             100),
-    ]
 
     for label, search, share in groups:
         if is_cancelled(ctx):
             break
         group_pool = max(share * 8, 60) if multi_kw else max(pool_size, 60)
-        group_start = len(papers)
         if multi_kw:
             _log(f"\n🔎 Keyword '{label}'…", run_id=run_id)
-
         sub_focus = effective_focus if (effective_focus and effective_focus.lower() not in label.lower()) else ""
 
-        for name, fn, cap in HARVESTERS:
-            if len(papers) - group_start >= group_pool or is_cancelled(ctx):
-                break
+        def _run(key: str, search=search, group_pool=group_pool, sub_focus=sub_focus):
+            name, fn, cap = HARVESTER_REGISTRY[key]
             try:
-                cand = fn(search, year_start, year_end, max_res=min(cap, group_pool), ctx=ctx,
-                          focus=sub_focus, min_relevance=min_relevance)
+                return name, fn(search, year_start, year_end, max_res=min(cap, group_pool), ctx=ctx,
+                                focus=sub_focus, min_relevance=min_relevance)
+            except Exception as e:
+                _log(f"  ⚠️ {name} harvest error: {e}", run_id=run_id)
+                return name, []
+
+        with ThreadPoolExecutor(max_workers=max(1, len(srcs))) as pool:
+            for _name, cand in pool.map(_run, srcs):
                 for p in cand:
                     p.keyword = label if multi_kw else ""
                     papers.append(p)
-            except Exception as e:
-                _log(f"  ⚠️ {name} harvest error: {e}", run_id=run_id)
 
     if is_cancelled(ctx) or not papers:
+        if not papers and not is_cancelled(ctx):
+            _log("  ⚠️  No sources returned relevant papers. Check your internet connection, or try "
+                 "broader keywords, a wider year range or a lower minimum relevance.", run_id=run_id)
         return []
 
     # ── PHASE 2: Rank & Filter ────────────────────────────────────────────────
-    if status_callback:
-        status_callback("Phase 2: Ranking by journal quartile & citations…", "#58a6ff")
+    _emit(phase_callback, "ranking")
+    _emit(status_callback, "Phase 2: Ranking by journal quartile & citations…", "#58a6ff")
     _log(f"\n📈 Phase 2: Processing {len(papers)} candidate papers…", run_id=run_id)
 
     try:
@@ -2538,49 +2742,72 @@ def execute_research_workflow(
     if mode == "incremental":
         already = history_identifiers(query_norm)
         before = len(filtered)
-        filtered = [p for p in filtered if (p.clean_doi() not in already and p.title_hash() not in already)]
-        _log(f"  ♻️  Incremental: skipped {before - len(filtered)} already-downloaded, {len(filtered)} new", run_id=run_id)
+        filtered = [p for p in filtered if _paper_identifier(p) not in already
+                    and p.title_hash() not in already]
+        _log(f"  ♻️  Incremental: skipped {before - len(filtered)} already-downloaded, {len(filtered)} new",
+             run_id=run_id)
 
     if not filtered:
         _log("  ⚠️  No papers passed the quartile & relevance filters.", run_id=run_id)
+        if quartile_filter != "all":
+            _log("     Tip: choose 'All (including preprints)' or lower the relevance threshold.",
+                 run_id=run_id)
         return []
 
-    # Sorting
-    if sort_strategy == "citations":
-        filtered.sort(key=lambda p: -p.citations)
-    elif sort_strategy == "newest":
-        filtered.sort(key=lambda p: (-(int(p.year) if p.year.isdigit() else 0), -p.citations))
-    else:  # 'quartile_cits'
-        q_order = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4, "Preprint": 5, "Unranked": 6, "": 7}
-        filtered.sort(key=lambda p: (q_order.get(p.quartile, 9), -p.citations))
+    rank_papers(filtered, sort_strategy)
 
     q1 = sum(1 for p in filtered if p.quartile == "Q1")
     q2 = sum(1 for p in filtered if p.quartile == "Q2")
     q3 = sum(1 for p in filtered if p.quartile == "Q3")
     q4 = sum(1 for p in filtered if p.quartile == "Q4")
     unranked = len(filtered) - (q1 + q2 + q3 + q4)
-    _log(f"\n🎯 Ranked Pool: {len(filtered)} papers (Q1:{q1} | Q2:{q2} | Q3:{q3} | Q4:{q4} | Other:{unranked})", run_id=run_id)
+    _log(f"\n🎯 Ranked Pool: {len(filtered)} papers (Q1:{q1} | Q2:{q2} | Q3:{q3} | Q4:{q4} | Other:{unranked})",
+         run_id=run_id)
+    return filtered
 
-    # ── PHASE 3: Download ─────────────────────────────────────────────────────
-    if status_callback:
-        status_callback(f"Phase 3: Downloading PDFs (0/{max_articles})…", "#3fb950")
-    _log(f"🚀 Downloading top {max_articles} papers with {MAX_WORKERS} threads…\n", run_id=run_id)
+def download_papers(
+    papers: list[Paper],
+    save_folder: Path | str,
+    max_articles: int,
+    ctx: DownloadContext | None = None,
+    query_norm: str = "",
+    balance_keywords: bool = True,
+    progress_callback=None,
+    status_callback=None,
+    paper_callback=None,
+    phase_callback=None,
+) -> list[Paper]:
+    """PHASE 3 + 4: download the top ``max_articles`` papers (Q1/Q2 -> Q1_Q2/, others
+    -> Q3_Q4/), then write the citation files and record history."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    folder = Path(save_folder) if save_folder else get_default_save_folder()
+    q_hi, q_lo = folder / "Q1_Q2", folder / "Q3_Q4"
+    for d in (folder, q_hi, q_lo):
+        d.mkdir(parents=True, exist_ok=True)
     if not ctx:
-        ctx = DownloadContext(run_id, max_articles, folder)
+        ctx = DownloadContext(1, max_articles, folder)
+    run_id = ctx.run_id
+    ctx.target_downloads = max_articles
+    if not balance_keywords:
+        ctx.kw_targets, ctx.kw_done = {}, {}
+    multi_kw = bool(ctx.kw_targets)
 
-    by_url: dict[str, Paper] = {}
-    targets = []
-    for p in filtered:
+    _emit(phase_callback, "downloading")
+    _emit(status_callback, f"Phase 3: Downloading PDFs (0/{max_articles})…", "#3fb950")
+    _emit(progress_callback, 0, max_articles)
+    _log(f"🚀 Downloading top {max_articles} papers with {MAX_WORKERS} threads…"
+         f"{'' if ctx.allow_scihub else '  (Sci-Hub fallback: off)'}\n", run_id=run_id)
+
+    def _target(p: Paper, balanced: bool) -> tuple:
         dest = q_hi if p.quartile in ("Q1", "Q2") else q_lo
-        by_url[p.url] = p
-        pk = p.keyword or None
-        targets.append((p.url, clean_title(p.title), p.clean_doi(), dest, ctx, pk, p.candidate_urls))
+        pk = (p.keyword or None) if balanced else None
+        return (p.url, clean_title(p.title), p.clean_doi(), dest, ctx, pk, p.candidate_urls)
 
+    by_url: dict[str, Paper] = {p.url: p for p in papers}
+    targets = [_target(p, multi_kw) for p in papers]
     done_count = 0
     skipped_urls: set[str] = set()
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def _drain(items):
         nonlocal done_count
@@ -2591,7 +2818,8 @@ def execute_research_workflow(
             try:
                 for future in as_completed(futures):
                     if ctx.cancellation_event.is_set():
-                        for f in futures: f.cancel()
+                        for f in futures:
+                            f.cancel()
                         break
                     try:
                         res = future.result()
@@ -2605,34 +2833,30 @@ def execute_research_workflow(
 
                     done_count += 1
                     pp = by_url.get(res["url"])
-                    if res["success"]:
-                        if pp:
-                            pp.pdf_path = res.get("path", "")
-                            if paper_callback:
-                                try:
-                                    paper_callback(pp, res)
-                                except Exception:
-                                    pass
+                    if res["success"] and pp:
+                        pp.pdf_path = res.get("path", "")
+                        _emit(paper_callback, pp, res)
 
                     with ctx.lock:
                         succ = ctx.successful_downloads
 
-                    if progress_callback:
-                        progress_callback(succ, max_articles)
-                    if status_callback:
-                        status_callback(f"Downloading: {succ}/{max_articles} saved (checked {done_count})", "#3fb950")
+                    _emit(progress_callback, succ, max_articles)
+                    _emit(status_callback, f"Downloading: {succ}/{max_articles} saved (checked {done_count})",
+                          "#3fb950")
 
                     icon = "✅" if res["success"] else "❌"
                     qtag = pp.quartile if pp else ""
                     rel_tag = f"{int(pp.relevance_score * 100)}%" if pp and pp.relevance_score > 0 else "—"
                     detail = f"{res['bytes'] // 1024} KB" if res["success"] else res.get("error", "failed")[:45]
-                    _log(f"  {icon} [{qtag or '—':<4} | {rel_tag:>4}] {res['title'][:50]:<50} {detail}", run_id=run_id)
+                    _log(f"  {icon} [{qtag or '—':<4} | {rel_tag:>4}] {res['title'][:50]:<50} {detail}",
+                         run_id=run_id)
 
                     with ctx.lock:
                         if ctx.successful_downloads >= ctx.target_downloads:
                             break
             finally:
-                for f in futures: f.cancel()
+                for f in futures:
+                    f.cancel()
 
     # Pass 1: Balanced across keywords
     _drain(targets)
@@ -2642,38 +2866,214 @@ def execute_research_workflow(
         need_more = ctx.successful_downloads < ctx.target_downloads and not ctx.cancellation_event.is_set()
         gap = ctx.target_downloads - ctx.successful_downloads
     if multi_kw and need_more and skipped_urls:
-        reclaim = [
-            (p.url, clean_title(p.title), p.clean_doi(),
-             q_hi if p.quartile in ("Q1", "Q2") else q_lo, ctx, None, p.candidate_urls)
-            for p in filtered if not p.pdf_path and p.url in skipped_urls
-        ]
+        reclaim = [_target(p, False) for p in papers if not p.pdf_path and p.url in skipped_urls]
         if reclaim:
             _log(f"\n♻️  Filling {gap} leftover slot(s) from held-back candidates…", run_id=run_id)
             _drain(reclaim)
 
     # ── PHASE 4: Citations & Memory ───────────────────────────────────────────
-    downloaded = [p for p in filtered if p.pdf_path]
+    downloaded = [p for p in papers if p.pdf_path]
     if downloaded:
+        _emit(phase_callback, "citations")
         _log("\n📚 Writing references.bib, .ris, APA 7th, results.csv, corpus_metadata.json…", run_id=run_id)
         try:
             write_bibliography(downloaded, folder)
         except Exception as e:
             _log(f"  ⚠️  Citation export failed: {e}", run_id=run_id)
-        record_history(query_norm, downloaded)
+        if query_norm:
+            record_history(query_norm, downloaded)
 
     with ctx.lock:
         succ = ctx.successful_downloads
-        hi = sum(1 for p in downloaded if p.quartile in ("Q1", "Q2"))
-        lo = len(downloaded) - hi
+        failed = ctx.failed_downloads
+    hi = sum(1 for p in downloaded if p.quartile in ("Q1", "Q2"))
+    lo = len(downloaded) - hi
 
     _log(f"\n{'═'*65}", run_id=run_id)
-    _log(f"  🏆 COMPLETE — {succ} PDFs saved   (Q1_Q2: {hi}  |  Q3_Q4/Preprint: {lo})", run_id=run_id)
+    verdict = "🛑 CANCELLED" if ctx.cancellation_event.is_set() else "🏆 COMPLETE"
+    _log(f"  {verdict} — {succ} PDFs saved   (Q1_Q2: {hi}  |  Q3_Q4/Preprint: {lo}  |  failed: {failed})",
+         run_id=run_id)
     _log(f"  📁 Output Directory: {folder}", run_id=run_id)
     _log(f"{'═'*65}\n", run_id=run_id)
 
-    if status_callback:
-        status_callback(f"Complete — {succ} PDFs (Q1_Q2: {hi}, Q3_Q4: {lo})", "#3fb950")
+    if ctx.cancellation_event.is_set():
+        _emit(status_callback, f"Cancelled — {succ} PDF(s) kept", "#f43f5e")
+    else:
+        _emit(status_callback, f"Complete — {succ} PDFs (Q1_Q2: {hi}, Q3_Q4: {lo})", "#3fb950")
     return downloaded
+
+def _log_run_banner(run_id: int, title: str, lines: list[str]):
+    _log(f"\n{'═'*65}", run_id=run_id)
+    _log(f"  🚀 {APP_NAME.upper()} v{APP_VERSION} — {title}", run_id=run_id)
+    for ln in lines:
+        _log(f"  {ln}", run_id=run_id)
+    _log(f"{'═'*65}\n", run_id=run_id)
+
+def execute_research_workflow(
+    keywords: str,
+    focus: str = "",
+    year_start: str = "2023",
+    year_end: str = "2026",
+    max_articles: int = 50,
+    save_folder: Path | str = "",
+    quartile_filter: str = "all_ranked",  # 'q1_q2', 'all_ranked', 'all'
+    sort_strategy: str = "quartile_cits",  # 'quartile_cits', 'citations', 'newest', 'relevance'
+    mode: str = "fresh",
+    min_relevance: float = DEFAULT_MIN_RELEVANCE,
+    ctx: DownloadContext | None = None,
+    progress_callback=None,
+    status_callback=None,
+    paper_callback=None,
+    sources=None,
+    download: bool = True,
+    phase_callback=None,
+) -> list[Paper]:
+    """Autonomous harvest -> rank -> download -> cite pipeline (headless & GUI reusable).
+
+    With ``download=False`` it stops after ranking and returns the candidate pool
+    (preview mode); pass the chosen papers to :func:`download_papers` later."""
+    folder = Path(save_folder) if save_folder else get_default_save_folder()
+    run_id = _begin_run(folder, ctx)
+    if ctx is None:
+        ctx = DownloadContext(run_id, max_articles, folder)
+
+    _log_run_banner(run_id, "Topic search" if download else "Preview (no downloads)", [
+        f"Query: {keywords} | Focus: {focus or 'None'} | Years: {year_start}-{year_end}",
+        f"Target: {max_articles} PDFs | Filter: {quartile_filter} | Sort: {sort_strategy} | "
+        f"Min Match: {int(min_relevance * 100)}%",
+        f"Folder: {folder}",
+    ])
+
+    ranked = harvest_and_rank(
+        keywords, focus, year_start, year_end, max_articles, quartile_filter, sort_strategy,
+        mode, min_relevance, ctx=ctx, sources=sources,
+        status_callback=status_callback, phase_callback=phase_callback,
+    )
+    if not download or not ranked or is_cancelled(ctx):
+        if not download and ranked:
+            _log(f"👀 Preview ready: {len(ranked)} ranked candidates (nothing downloaded).", run_id=run_id)
+            _emit(status_callback, f"Preview ready — {len(ranked)} candidates", "#3fb950")
+        return ranked if not download else []
+
+    return download_papers(
+        ranked, folder, max_articles, ctx=ctx, query_norm=normalize_query(keywords, focus),
+        progress_callback=progress_callback, status_callback=status_callback,
+        paper_callback=paper_callback, phase_callback=phase_callback,
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DOI LIST MODE (download exact papers you already know)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_doi_list(text: str) -> list[str]:
+    """Extract unique DOIs from free text (one per line, doi.org links, commas…)."""
+    out: list[str] = []
+    for chunk in re.split(r"[\s,;]+", text or ""):
+        d = _extract_doi(chunk)
+        if d and d.lower() not in (x.lower() for x in out):
+            out.append(d)
+    return out
+
+def _paper_from_openalex_item(item: dict) -> Paper:
+    doi = _extract_doi(item.get("doi") or "")
+    pl = item.get("primary_location") or {}
+    best = item.get("best_oa_location") or {}
+    src = pl.get("source") or best.get("source") or {}
+    issns = list(src.get("issn") or [])
+    if src.get("issn_l"):
+        issns = [src["issn_l"]] + issns
+    cand: list[str] = []
+    for loc in item.get("locations") or []:
+        for u in (loc.get("pdf_url"), loc.get("landing_page_url")):
+            if u and _is_real_http_url(u) and u not in cand:
+                cand.append(u)
+    url = best.get("pdf_url") or pl.get("pdf_url") or (cand[0] if cand else f"https://doi.org/{doi}")
+    return Paper(
+        url=url, title=clean_title(item.get("title") or ""), doi=doi,
+        authors=[(a.get("author") or {}).get("display_name") for a in (item.get("authorships") or [])[:25]
+                 if (a.get("author") or {}).get("display_name")],
+        year=str(item.get("publication_year") or ""), journal=src.get("display_name") or "",
+        issns=issns, citations=item.get("cited_by_count") or 0,
+        abstract=_reconstruct_abstract(item.get("abstract_inverted_index")),
+        candidate_urls=cand, relevance_score=1.0, source="DOI list",
+    )
+
+def fetch_papers_by_doi(dois: list[str], ctx: DownloadContext | None = None) -> list[Paper]:
+    """Resolve DOIs to full metadata (OpenAlex batch, Crossref fallback)."""
+    run_id = ctx.run_id if ctx else None
+    found: dict[str, Paper] = {}
+    for i in range(0, len(dois), 50):
+        if is_cancelled(ctx):
+            break
+        batch = dois[i:i + 50]
+        r = safe_get("https://api.openalex.org/works", ctx=ctx, headers={"User-Agent": polite_ua()}, params={
+            "filter": "doi:" + "|".join(batch), "per-page": 50, "mailto": CONTACT_EMAIL,
+        })
+        for item in (safe_json(r).get("results") or []) if r is not None and r.status_code == 200 else []:
+            p = _paper_from_openalex_item(item)
+            if p.doi:
+                found[p.doi.lower()] = p
+
+    for d in dois:
+        if d.lower() in found or is_cancelled(ctx):
+            continue
+        r = safe_get(f"https://api.crossref.org/works/{quote(d, safe='/')}", ctx=ctx, retries=2,
+                     params={"mailto": CONTACT_EMAIL}, quiet=True)
+        msg = safe_json(r).get("message") or {} if r is not None and r.status_code == 200 else {}
+        title = clean_title((msg.get("title") or [""])[0]) if msg else ""
+        authors = [f"{a.get('family')}, {a.get('given')}" if a.get("given") else a.get("family")
+                   for a in msg.get("author", []) if a.get("family")] if msg else []
+        dparts = ((msg.get("published") or {}).get("date-parts") or [[""]]) if msg else [[""]]
+        found[d.lower()] = Paper(
+            url=f"https://doi.org/{d}", title=title if title != "Untitled" else f"DOI {d}", doi=d,
+            authors=authors, year=str(dparts[0][0] or "") if dparts and dparts[0] else "",
+            journal=((msg.get("container-title") or [""])[0] if msg else ""),
+            issns=list(msg.get("ISSN") or []) if msg else [],
+            citations=(msg.get("is-referenced-by-count") or 0) if msg else 0,
+            candidate_urls=[l.get("URL") for l in (msg.get("link") or []) if _is_real_http_url(l.get("URL", ""))]
+            if msg else [],
+            relevance_score=1.0, source="DOI list",
+        )
+        if not msg:
+            _log(f"  ⚠️  No metadata found for {d}; will still try to fetch it.", run_id=run_id)
+
+    ordered = [found[d.lower()] for d in dois if d.lower() in found]
+    for p in ordered:
+        p.quartile = quartile_for(p.issns, p.journal) or (
+            "Preprint" if "arxiv" in (p.journal or "").lower() else "Unranked")
+    return ordered
+
+def execute_doi_workflow(
+    dois: list[str] | str,
+    save_folder: Path | str = "",
+    ctx: DownloadContext | None = None,
+    progress_callback=None,
+    status_callback=None,
+    paper_callback=None,
+    phase_callback=None,
+) -> list[Paper]:
+    """Download an explicit list of DOIs (metadata lookup -> download -> citations)."""
+    doi_list = parse_doi_list(dois) if isinstance(dois, str) else parse_doi_list(" ".join(dois))
+    folder = Path(save_folder) if save_folder else get_default_save_folder()
+    run_id = _begin_run(folder, ctx)
+    if ctx is None:
+        ctx = DownloadContext(run_id, len(doi_list), folder)
+    _log_run_banner(run_id, "DOI list", [f"DOIs: {len(doi_list)}", f"Folder: {folder}"])
+    if not doi_list:
+        _log("  ⚠️  No valid DOIs found in the input.", run_id=run_id)
+        return []
+
+    _emit(phase_callback, "harvesting")
+    _emit(status_callback, f"Resolving metadata for {len(doi_list)} DOI(s)…", "#58a6ff")
+    load_scimago_quartiles()
+    papers = fetch_papers_by_doi(doi_list, ctx)
+    if is_cancelled(ctx):
+        return []
+    return download_papers(
+        papers, folder, len(papers), ctx=ctx, query_norm="doi list", balance_keywords=False,
+        progress_callback=progress_callback, status_callback=status_callback,
+        paper_callback=paper_callback, phase_callback=phase_callback,
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TKINTER GUI DASHBOARD
@@ -2681,7 +3081,7 @@ def execute_research_workflow(
 
 if HAS_TKINTER:
     class ResearchAppDashboard:
-        # Luxury Obsidian 4K Dark Glass Palette
+        # Dark palette
         BG          = "#090d16"      # Deep obsidian space canvas
         CARD        = "#111827"      # Elevated glass card
         CARD_ALT    = "#0b0f19"      # Inset field/terminal background
@@ -2705,14 +3105,14 @@ if HAS_TKINTER:
         def __init__(self):
             self.root = tk.Tk()
 
-            # 1. 4K High-DPI Scaling Engine
+            # 1. High-DPI scaling
             try:
                 dpi_inch = self.root.winfo_fpixels('1i')
                 self.scale = max(1.0, dpi_inch / 96.0)
             except Exception:
                 self.scale = 1.0
 
-            self.root.title("Research Literature Harvester v10 Ultra Pro — 4K UHD Edition")
+            self.root.title(f"{APP_NAME} v{APP_VERSION} — Research Literature Harvester")
             self.root.configure(bg=self.BG)
 
             # Center window with high-DPI scaled dimensions
@@ -2826,20 +3226,20 @@ if HAS_TKINTER:
             title_row = tk.Frame(htext, bg=self.BG)
             title_row.pack(anchor="w")
 
-            badge = tk.Label(title_row, text="⚡ 4K ULTRA HD", bg="#162638", fg=self.CYAN,
+            badge = tk.Label(title_row, text=f"v{APP_VERSION}", bg="#162638", fg=self.CYAN,
                              font=("Segoe UI", int(7.5 * self.scale), "bold"),
                              padx=int(6 * self.scale), pady=int(2 * self.scale),
                              highlightthickness=1, highlightbackground=self.CYAN)
             badge.pack(side="left", padx=(0, int(8 * self.scale)))
 
-            tk.Label(title_row, text="Research Literature Harvester v10 Ultra Pro", bg=self.BG, fg=self.TXT,
+            tk.Label(title_row, text=f"{APP_NAME}  ·  Research Literature Harvester", bg=self.BG, fg=self.TXT,
                      font=self.title_font).pack(side="left")
 
             engine_str = "   •   curl_cffi active (stealth impersonation)" if HAS_CFFI else "   •   requests mode"
             engine_fg = self.EMERALD if HAS_CFFI else self.TXT_MUTED
             sub_row = tk.Frame(htext, bg=self.BG)
             sub_row.pack(anchor="w", pady=(int(2 * self.scale), 0))
-            tk.Label(sub_row, text="60% Relevance Gate  ·  Discipline Collision Guard  ·  Multi-Tier 6-Layer Cascading",
+            tk.Label(sub_row, text="9 scholarly sources  ·  SCImago quartile ranking  ·  Relevance gate  ·  BibTeX / RIS / APA export",
                      bg=self.BG, fg=self.TXT_MUTED, font=self.sub_font).pack(side="left")
             tk.Label(sub_row, text=engine_str, bg=self.BG, fg=engine_fg, font=self.sub_font).pack(side="left")
 
@@ -2906,21 +3306,22 @@ if HAS_TKINTER:
                                    relief="flat", font=self.label_font, width=6,
                                    highlightthickness=1, highlightbackground=self.BORDER, highlightcolor=self.BORDER_FOCUS)
             self.ent_y1.grid(row=0, column=1, sticky="w", ipady=int(4 * self.scale))
-            self.ent_y1.insert(0, "2023")
+            self.ent_y1.insert(0, str(CURRENT_YEAR - 3))
 
             tk.Label(years_row, text="To", bg=self.CARD, fg=self.TXT_DIM, font=self.sub_font).grid(row=0, column=2, padx=(12, 6))
             self.ent_y2 = tk.Entry(years_row, bg=self.CARD_ALT, fg=self.TXT, insertbackground=self.TXT,
                                    relief="flat", font=self.label_font, width=6,
                                    highlightthickness=1, highlightbackground=self.BORDER, highlightcolor=self.BORDER_FOCUS)
             self.ent_y2.grid(row=0, column=3, sticky="w", ipady=int(4 * self.scale))
-            self.ent_y2.insert(0, "2026")
+            self.ent_y2.insert(0, str(CURRENT_YEAR))
 
             # Presets Frame
             p_frame = tk.Frame(years_row, bg=self.CARD)
             p_frame.grid(row=0, column=4, sticky="e", padx=(16, 0))
-            self._button(p_frame, "⚡ 2024–2026", lambda: self._set_year_preset("2024", "2026"), kind="chip").pack(side="left", padx=2)
-            self._button(p_frame, "📅 Past 5 Yrs", lambda: self._set_year_preset("2021", "2026"), kind="chip").pack(side="left", padx=2)
-            self._button(p_frame, "🌐 All Time", lambda: self._set_year_preset("2000", "2026"), kind="chip").pack(side="left", padx=2)
+            cy = CURRENT_YEAR
+            self._button(p_frame, "Last 3 yrs", lambda: self._set_year_preset(str(cy - 2), str(cy)), kind="chip").pack(side="left", padx=2)
+            self._button(p_frame, "Last 5 yrs", lambda: self._set_year_preset(str(cy - 4), str(cy)), kind="chip").pack(side="left", padx=2)
+            self._button(p_frame, "Since 2000", lambda: self._set_year_preset("2000", str(cy)), kind="chip").pack(side="left", padx=2)
 
             # Max Articles & Journal Filter
             self.ent_max = self._field(grid, "Max articles", 3, 0)
@@ -2940,6 +3341,13 @@ if HAS_TKINTER:
                                               state="readonly", font=self.label_font)
             self.cbo_relevance.current(0)
             self.cbo_relevance.grid(row=4, column=1, sticky="we", pady=(int(6 * self.scale), int(3 * self.scale)))
+
+            tk.Label(grid, text="Sort By", bg=self.CARD, fg=self.TXT_MUTED,
+                     font=self.label_font).grid(row=4, column=2, sticky="w", pady=(int(6 * self.scale), int(3 * self.scale)), padx=(int(12 * self.scale), int(8 * self.scale)))
+            self.cbo_sort = ttk.Combobox(grid, values=["Journal quartile, then citations", "Most cited", "Newest first", "Best relevance match"],
+                                         state="readonly", font=self.label_font)
+            self.cbo_sort.current(0)
+            self.cbo_sort.grid(row=4, column=3, sticky="we", pady=(int(6 * self.scale), int(3 * self.scale)))
 
             # Save Folder Row
             tk.Label(grid, text="Save Destination", bg=self.CARD, fg=self.TXT_MUTED,
@@ -3241,10 +3649,7 @@ if HAS_TKINTER:
             p = self._get_selected_paper()
             if p and p.pdf_path and Path(p.pdf_path).exists():
                 try:
-                    if sys.platform == "win32":
-                        subprocess.Popen(f'explorer /select,"{p.pdf_path}"')
-                    else:
-                        subprocess.Popen(["xdg-open", str(Path(p.pdf_path).parent)])
+                    _open_with_os(Path(p.pdf_path), reveal=True)
                 except Exception as e:
                     messagebox.showerror("Show in Explorer", f"Could not open the file location:\n{e}")
 
@@ -3260,12 +3665,7 @@ if HAS_TKINTER:
         def _copy_selected_apa(self):
             p = self._get_selected_paper()
             if p:
-                auth = _authors_apa(p.authors) if p.authors else "Unknown"
-                yr = f"({p.year})" if p.year else "(n.d.)"
-                t = clean_title(p.title)
-                j = f" {p.journal}." if p.journal else ""
-                d = f" https://doi.org/{p.clean_doi()}" if p.clean_doi() else ""
-                apa = f"{auth} {yr}. {t}.{j}{d}"
+                apa = format_apa(p)
                 self.root.clipboard_clear()
                 self.root.clipboard_append(apa)
                 self.set_status("Copied APA 7 citation to clipboard", self.CYAN)
@@ -3282,14 +3682,7 @@ if HAS_TKINTER:
             if not self.downloaded_papers_list:
                 messagebox.showinfo("Copy Citations", "No papers downloaded yet in current run.")
                 return
-            lines = []
-            for p in self.downloaded_papers_list:
-                auth = _authors_apa(p.authors) if p.authors else "Unknown"
-                yr = f"({p.year})" if p.year else "(n.d.)"
-                t = clean_title(p.title)
-                j = f" {p.journal}." if p.journal else ""
-                d = f" https://doi.org/{p.clean_doi()}" if p.clean_doi() else ""
-                lines.append(f"{auth} {yr}. {t}.{j}{d}")
+            lines = [format_apa(p) for p in self.downloaded_papers_list]
             text = "\n\n".join(lines)
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
@@ -3349,8 +3742,8 @@ if HAS_TKINTER:
                 phase = "[PHASE 3: DOWNLOADING]"
             elif "Complete" in text or "saved" in text:
                 phase = "[COMPLETE]"
-            elif "Cancel" in text:
-                phase = "[CANCELLED]"
+            if "Cancel" in text:
+                phase = "[CANCELLING]" if "Cancelling" in text else "[CANCELLED]"
 
             def _update():
                 self.lbl_status_phase.configure(text=phase)
@@ -3417,9 +3810,10 @@ if HAS_TKINTER:
                 if hasattr(self, "cbo_quartile"):
                     try: self.cbo_quartile.configure(state="readonly" if enable else "disabled")
                     except Exception: pass
-                if hasattr(self, "cbo_relevance"):
-                    try: self.cbo_relevance.configure(state="readonly" if enable else "disabled")
-                    except Exception: pass
+                for cbo in (getattr(self, "cbo_relevance", None), getattr(self, "cbo_sort", None)):
+                    if cbo is not None:
+                        try: cbo.configure(state="readonly" if enable else "disabled")
+                        except Exception: pass
                 if hasattr(self, "btn_start"):
                     try: self.btn_start.configure(state=state)
                     except Exception: pass
@@ -3432,9 +3826,14 @@ if HAS_TKINTER:
             with lock_run_id:
                 if run_id != active_run_id:
                     return
-            self.enable_inputs(True)
-            self.is_running = False
-            self.update_stats()
+            def _done():
+                cancelled = bool(getattr(self, "ctx", None) and self.ctx.cancellation_event.is_set())
+                self.is_running = False
+                self.enable_inputs(True)
+                self.update_stats()
+                if cancelled:
+                    self.set_status("Cancelled by user", self.ROSE)
+            self.root.after(0, _done)
 
         def on_closing(self):
             if self.is_running:
@@ -3445,13 +3844,13 @@ if HAS_TKINTER:
                 self.root.destroy()
 
         def cancel_download(self):
+            # Inputs stay locked until the worker thread really exits (_finalize_run),
+            # so a second run can never overlap the one that is still shutting down.
             if self.is_running and hasattr(self, "ctx"):
                 _log("\n🛑 Cancellation requested. Stopping workers...", run_id=self.ctx.run_id)
                 self.ctx.cancellation_event.set()
                 self.btn_cancel.configure(state="disabled")
-                self.enable_inputs(True)
-                self.is_running = False
-                self.set_status("Cancelled by user", self.ROSE)
+                self.set_status("Cancelling — waiting for active downloads to stop…", self.AMBER)
 
         def start_download(self):
             kw = self.ent_keywords.get().strip()
@@ -3498,7 +3897,10 @@ if HAS_TKINTER:
             else:
                 min_rel = 0.60
 
-            query_norm = f"{kw} {focus}".strip().lower()
+            sort_map = {"Most cited": "citations", "Newest first": "newest", "Best relevance match": "relevance"}
+            sort_strategy = sort_map.get(self.cbo_sort.get(), "quartile_cits")
+
+            query_norm = normalize_query(kw, focus)
             mode = "fresh"
             seen = query_seen_count(query_norm)
             if seen:
@@ -3571,6 +3973,7 @@ if HAS_TKINTER:
                         max_articles=max_val,
                         save_folder=folder,
                         quartile_filter=q_filter,
+                        sort_strategy=sort_strategy,
                         mode=mode,
                         min_relevance=min_rel,
                         ctx=self.ctx,
@@ -3587,207 +3990,376 @@ if HAS_TKINTER:
             self.worker_thread.start()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NEXT-GEN WEB APPLICATION SERVER & NATIVE DESKTOP APP WINDOW
+#  WEB APPLICATION SERVER (local-only) & NATIVE DESKTOP APP WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
 
 try:
-    from flask import Flask, request, jsonify, Response, send_file
+    from flask import Flask, request, jsonify, Response, send_file, abort
     HAS_FLASK = True
 except ImportError:
     HAS_FLASK = False
 
+PHASE_PROGRESS = {"idle": 0, "harvesting": 8, "ranking": 32, "downloading": 40,
+                  "citations": 97, "complete": 100, "cancelled": 100, "error": 100}
+
+def paper_to_dict(p: Paper, size_bytes: int | None = None) -> dict:
+    """JSON-safe view of a Paper for the web UI."""
+    size = size_bytes if size_bytes is not None else (
+        os.path.getsize(p.pdf_path) if p.pdf_path and os.path.exists(p.pdf_path) else 0)
+    return {
+        "id": _paper_identifier(p),
+        "title": clean_title(p.title),
+        "authors": p.authors,
+        "authors_apa": _authors_apa(p.authors),
+        "year": p.year,
+        "journal": p.journal,
+        "doi": p.clean_doi(),
+        "url": p.url,
+        "citations": p.citations,
+        "quartile": p.quartile or "Unranked",
+        "relevance_score": round(p.relevance_score, 3),
+        "source": p.source,
+        "keyword": p.keyword,
+        "pdf_path": p.pdf_path,
+        "bytes": size,
+        "abstract": p.abstract or "",
+        "concepts": p.concepts[:8],
+        "open_access": any(_is_pdf_link(u) for u in [p.url] + p.candidate_urls),
+    }
+
+def _to_int(v, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+def _to_float(v, default: float, lo: float, hi: float) -> float:
+    try:
+        return max(lo, min(hi, float(v)))
+    except (TypeError, ValueError):
+        return default
+
 class ResearchWebController:
+    """Owns the single background job and the state the web UI renders."""
+
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.is_running = False
         self.worker_thread: threading.Thread | None = None
         self.ctx: DownloadContext | None = None
-        self.downloaded_papers: list[dict] = []
         self.current_folder = str(get_default_save_folder())
-        self.progress = 0.0
+        self.kind = "search"          # search | preview | dois | selected
         self.phase = "idle"
-        self.status_text = "Ready — configure parameters and click Start Literature Harvest"
-        self.target_articles = 50
-        self.downloaded_count = 0
+        self.progress = 0.0
+        self.status_text = "Ready — enter a topic and start a search."
+        self.target_articles = 0
         self.total_bytes = 0
-        self.q1_count = 0
-        self.q2_count = 0
-        self.q3_count = 0
-        self.q4_count = 0
-        self.avg_relevance = 1.0
+        self.started_at = 0.0
+        self.finished_at = 0.0
+        self.last_query = ""
+        self.last_params: dict = {}
+        self.downloaded: dict[str, Paper] = {}   # id -> Paper (insertion ordered)
+        self.sizes: dict[str, int] = {}
+        self.candidates: list[Paper] = []
 
-    def get_status_dict(self) -> dict:
+    # ── state ────────────────────────────────────────────────────────────────
+    def _counts(self) -> dict:
+        qs = [p.quartile for p in self.downloaded.values()]
+        rels = [p.relevance_score for p in self.downloaded.values()]
+        return {
+            "q1": qs.count("Q1"), "q2": qs.count("Q2"), "q3": qs.count("Q3"), "q4": qs.count("Q4"),
+            "other": sum(1 for q in qs if q not in ("Q1", "Q2", "Q3", "Q4")),
+            "avg_relevance": round(sum(rels) / len(rels), 3) if rels else 0.0,
+        }
+
+    def get_status_dict(self, include_papers: bool = True) -> dict:
         with self.lock:
-            return {
+            now = self.finished_at if (self.finished_at and not self.is_running) else time.time()
+            d = {
                 "is_running": self.is_running,
-                "progress": round(self.progress, 1),
+                "kind": self.kind,
                 "phase": self.phase,
+                "progress": round(self.progress, 1),
                 "status_text": self.status_text,
-                "downloaded": self.downloaded_count,
+                "downloaded": len(self.downloaded),
                 "target": self.target_articles,
                 "bytes": self.total_bytes,
-                "q1": self.q1_count,
-                "q2": self.q2_count,
-                "q3": self.q3_count,
-                "q4": self.q4_count,
-                "avg_relevance": round(self.avg_relevance, 2),
+                "elapsed": round(now - self.started_at, 1) if self.started_at else 0,
                 "folder": self.current_folder,
-                "papers": list(self.downloaded_papers),
+                "query": self.last_query,
+                "candidates": len(self.candidates),
+                "failed": self.ctx.failed_downloads if self.ctx else 0,
+                **self._counts(),
             }
+            if include_papers:
+                d["papers"] = [paper_to_dict(p, self.sizes.get(k)) for k, p in self.downloaded.items()]
+            return d
+
+    def _set_phase(self, phase: str, message: str | None = None):
+        with self.lock:
+            self.phase = phase
+            if phase in PHASE_PROGRESS and phase != "downloading":
+                self.progress = max(self.progress, PHASE_PROGRESS[phase]) if phase not in (
+                    "complete", "cancelled", "error") else 100.0
+            if message:
+                self.status_text = message
+        self._broadcast_progress()
+
+    def _broadcast_progress(self):
+        _broadcast_sse({"type": "progress", **self.get_status_dict(include_papers=False)})
+
+    # ── callbacks wired into the engine ─────────────────────────────────────
+    def _on_progress(self, succ: int, total: int):
+        with self.lock:
+            if self.phase == "downloading":
+                frac = succ / max(total, 1)
+                self.progress = PHASE_PROGRESS["downloading"] + frac * (PHASE_PROGRESS["citations"] - 40)
+        self._broadcast_progress()
+
+    def _on_status(self, msg: str, _color: str = ""):
+        with self.lock:
+            self.status_text = msg
+        self._broadcast_progress()
+
+    def _on_paper(self, p: Paper, res: dict):
+        pid = _paper_identifier(p)
+        with self.lock:
+            self.downloaded[pid] = p
+            self.sizes[pid] = res.get("bytes", 0)
+            self.total_bytes += res.get("bytes", 0)
+            payload = paper_to_dict(p, res.get("bytes", 0))
+        _broadcast_sse({"type": "paper", "paper": payload})
+
+    # ── job control ─────────────────────────────────────────────────────────
+    def _prepare(self, kind: str, folder: Path, target: int, allow_scihub: bool) -> DownloadContext:
+        global active_run_id
+        with lock_run_id:
+            active_run_id += 1
+            run_id = active_run_id
+        self.kind = kind
+        self.current_folder = str(folder)
+        self.target_articles = target
+        self.total_bytes = 0
+        self.progress = 0.0
+        self.started_at = time.time()
+        self.finished_at = 0.0
+        if kind != "selected":
+            self.downloaded = {}
+            self.sizes = {}
+        self.is_running = True
+        self.ctx = DownloadContext(run_id, target, folder, allow_scihub=allow_scihub)
+        return self.ctx
+
+    def _launch(self, job, done_message):
+        def _worker():
+            ok = True
+            try:
+                job()
+            except Exception as e:
+                ok = False
+                _log(f"❌ Execution error: {e}")
+                with self.lock:
+                    self.status_text = f"Error: {e}"
+            finally:
+                cancelled = bool(self.ctx and self.ctx.cancellation_event.is_set())
+                with self.lock:
+                    self.is_running = False
+                    self.finished_at = time.time()
+                    self.phase = "cancelled" if cancelled else ("complete" if ok else "error")
+                    self.progress = 100.0
+                    if cancelled:
+                        self.status_text = f"Cancelled — {len(self.downloaded)} PDF(s) kept."
+                    elif ok:
+                        self.status_text = done_message()
+                _broadcast_sse({"type": "complete", "status": self.get_status_dict()})
+
+        self.worker_thread = threading.Thread(target=_worker, daemon=True)
+        self.worker_thread.start()
+
+    def _folder_from(self, payload: dict) -> Path:
+        folder_str = str(payload.get("save_folder") or "").strip()
+        folder = Path(folder_str).expanduser() if folder_str else get_default_save_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / ".write_test"
+        probe.touch()
+        probe.unlink()
+        return folder
 
     def start(self, payload: dict) -> dict:
+        """Start a topic search (download) or a preview (rank only)."""
         with self.lock:
             if self.is_running:
-                return {"status": "error", "message": "Harvest already in progress."}
-
-            keywords = (payload.get("keywords") or "").strip()
+                return {"status": "error", "message": "A job is already running. Cancel it first."}
+            keywords = str(payload.get("keywords") or "").strip()
             if not keywords:
-                return {"status": "error", "message": "Keywords are required."}
-
-            focus = (payload.get("focus") or "").strip()
-            y1 = str(payload.get("year_start") or "2023").strip()
-            y2 = str(payload.get("year_end") or "2026").strip()
-            max_val = int(payload.get("max_articles") or 50)
-            q_filter = str(payload.get("quartile_filter") or "all_ranked").strip()
-            mode = str(payload.get("mode") or "fresh").strip()
-            min_rel = float(payload.get("min_relevance") or DEFAULT_MIN_RELEVANCE)
-            folder_str = (payload.get("save_folder") or "").strip()
-            folder = Path(folder_str) if folder_str else get_default_save_folder()
-
+                return {"status": "error", "message": "Please enter keywords or a paper title."}
+            focus = str(payload.get("focus") or "").strip()
+            y1 = _to_int(payload.get("year_start"), CURRENT_YEAR - 3, 1900, CURRENT_YEAR + 1)
+            y2 = _to_int(payload.get("year_end"), CURRENT_YEAR, 1900, CURRENT_YEAR + 1)
+            if y1 > y2:
+                y1, y2 = y2, y1
+            max_val = _to_int(payload.get("max_articles"), 25, 1, MAX_ARTICLES)
+            q_filter = str(payload.get("quartile_filter") or "all_ranked")
+            q_filter = q_filter if q_filter in QUARTILE_FILTERS else "all_ranked"
+            sort = str(payload.get("sort") or "quartile_cits")
+            sort = sort if sort in SORT_STRATEGIES else "quartile_cits"
+            mode = "incremental" if payload.get("mode") == "incremental" else "fresh"
+            min_rel = _to_float(payload.get("min_relevance"), DEFAULT_MIN_RELEVANCE, 0.2, 1.0)
+            sources = resolve_sources(payload.get("sources"))
+            preview = bool(payload.get("preview"))
+            allow_scihub = bool(payload.get("allow_scihub", ALLOW_SCIHUB_DEFAULT))
             try:
-                folder.mkdir(parents=True, exist_ok=True)
+                folder = self._folder_from(payload)
             except Exception as e:
-                return {"status": "error", "message": f"Cannot write to folder: {e}"}
+                return {"status": "error", "message": f"Cannot write to the save folder: {e}"}
 
-            global active_run_id
-            with lock_run_id:
-                active_run_id += 1
-                current_run_id = active_run_id
-
-            self.current_folder = str(folder)
-            self.target_articles = max_val
-            self.downloaded_count = 0
-            self.total_bytes = 0
-            self.q1_count = 0
-            self.q2_count = 0
-            self.q3_count = 0
-            self.q4_count = 0
-            self.avg_relevance = 1.0
-            self.downloaded_papers = []
-            self.progress = 5.0
+            ctx = self._prepare("preview" if preview else "search", folder, max_val, allow_scihub)
+            self.candidates = []
+            self.last_query = normalize_query(keywords, focus)
+            self.last_params = {"keywords": keywords, "focus": focus, "max_articles": max_val}
             self.phase = "harvesting"
-            self.status_text = f"Harvesting across 9 scholarly APIs for '{keywords}'..."
-            self.is_running = True
-            self.ctx = DownloadContext(current_run_id, max_val, folder)
+            self.progress = PHASE_PROGRESS["harvesting"]
+            self.status_text = f"Searching {len(sources)} scholarly sources for “{keywords}”…"
 
-            def _progress_cb(pct: float, msg: str):
+        def job():
+            result = execute_research_workflow(
+                keywords=keywords, focus=focus, year_start=str(y1), year_end=str(y2),
+                max_articles=max_val, save_folder=folder, quartile_filter=q_filter,
+                sort_strategy=sort, mode=mode, min_relevance=min_rel, ctx=ctx,
+                sources=sources, download=not preview,
+                paper_callback=self._on_paper, progress_callback=self._on_progress,
+                status_callback=self._on_status, phase_callback=self._set_phase,
+            )
+            if preview:
                 with self.lock:
-                    self.progress = pct
-                    self.status_text = msg
-                    if pct < 25:
-                        self.phase = "harvesting"
-                    elif pct < 35:
-                        self.phase = "filtering"
-                    elif pct < 45:
-                        self.phase = "ranking"
-                    elif pct < 90:
-                        self.phase = "downloading"
-                    else:
-                        self.phase = "citations"
-                _broadcast_sse({
-                    "type": "progress",
-                    "percent": pct,
-                    "phase": self.phase,
-                    "message": msg
-                })
+                    self.candidates = result
+                _broadcast_sse({"type": "candidates", "count": len(result)})
 
-            def _status_cb(msg: str, color: str = ""):
-                with self.lock:
-                    self.status_text = msg
-                _broadcast_sse({
-                    "type": "progress",
-                    "percent": self.progress,
-                    "phase": self.phase,
-                    "message": msg
-                })
+        def done():
+            if preview:
+                n = len(self.candidates)
+                return (f"Preview ready — {n} ranked candidate(s). Select papers and click Download."
+                        if n else "No papers matched. Try broader keywords or lower the relevance.")
+            n = len(self.downloaded)
+            return (f"Done — {n} PDF(s) saved to {self.current_folder}" if n else
+                    "Finished — no PDFs could be downloaded (see Console for details).")
 
-            def _paper_cb(p: Paper, res: dict):
-                size_kb = res.get("bytes", 0) // 1024
-                size_str = f"{size_kb / 1024:.2f} MB" if size_kb > 1024 else f"{size_kb} KB"
-                q = (p.quartile or "Unranked").upper()
-                with self.lock:
-                    self.downloaded_count += 1
-                    self.total_bytes += res.get("bytes", 0)
-                    if q == "Q1":
-                        self.q1_count += 1
-                    elif q == "Q2":
-                        self.q2_count += 1
-                    elif q == "Q3":
-                        self.q3_count += 1
-                    elif q == "Q4":
-                        self.q4_count += 1
+        self._launch(job, done)
+        return {"status": "ok", "message": "Preview started" if preview else "Search started"}
 
-                    p_dict = {
-                        "title": clean_title(p.title),
-                        "authors": p.authors,
-                        "year": p.year,
-                        "journal": p.journal,
-                        "doi": p.clean_doi(),
-                        "citations": p.citations,
-                        "quartile": p.quartile or "Unranked",
-                        "relevance_score": p.relevance_score,
-                        "source": p.source,
-                        "pdf_path": p.pdf_path,
-                        "size_str": size_str,
-                        "abstract": p.abstract or "",
-                    }
-                    self.downloaded_papers.append(p_dict)
-                    total_rel = sum(x["relevance_score"] for x in self.downloaded_papers)
-                    self.avg_relevance = total_rel / len(self.downloaded_papers) if self.downloaded_papers else 1.0
+    def start_dois(self, payload: dict) -> dict:
+        with self.lock:
+            if self.is_running:
+                return {"status": "error", "message": "A job is already running. Cancel it first."}
+            dois = parse_doi_list(str(payload.get("dois") or ""))
+            if not dois:
+                return {"status": "error", "message": "No valid DOIs found (expected e.g. 10.1038/s41586-020-2649-2)."}
+            if len(dois) > MAX_ARTICLES:
+                return {"status": "error", "message": f"At most {MAX_ARTICLES} DOIs per run."}
+            try:
+                folder = self._folder_from(payload)
+            except Exception as e:
+                return {"status": "error", "message": f"Cannot write to the save folder: {e}"}
+            ctx = self._prepare("dois", folder, len(dois),
+                                bool(payload.get("allow_scihub", ALLOW_SCIHUB_DEFAULT)))
+            self.last_query = "doi list"
+            self.phase = "harvesting"
+            self.progress = PHASE_PROGRESS["harvesting"]
+            self.status_text = f"Resolving {len(dois)} DOI(s)…"
 
-                _broadcast_sse({"type": "paper", "paper": p_dict})
+        def job():
+            execute_doi_workflow(dois, folder, ctx=ctx, paper_callback=self._on_paper,
+                                 progress_callback=self._on_progress, status_callback=self._on_status,
+                                 phase_callback=self._set_phase)
 
-            def _thread_worker():
-                try:
-                    execute_research_workflow(
-                        keywords=keywords,
-                        focus=focus,
-                        year_start=y1,
-                        year_end=y2,
-                        max_articles=max_val,
-                        save_folder=folder,
-                        quartile_filter=q_filter,
-                        mode=mode,
-                        min_relevance=min_rel,
-                        ctx=self.ctx,
-                        paper_callback=_paper_cb,
-                        progress_callback=_progress_cb,
-                        status_callback=_status_cb,
-                    )
-                except Exception as e:
-                    _log(f"❌ Execution error: {e}", run_id=current_run_id)
-                finally:
-                    with self.lock:
-                        self.is_running = False
-                        self.phase = "complete"
-                        self.progress = 100.0
-                        self.status_text = f"Harvest complete — {self.downloaded_count} PDFs saved to {self.current_folder}"
-                    _broadcast_sse({"type": "complete", "status": self.get_status_dict()})
+        self._launch(job, lambda: f"Done — {len(self.downloaded)} of {len(dois)} DOI(s) downloaded.")
+        return {"status": "ok", "message": f"Downloading {len(dois)} DOI(s)"}
 
-            self.worker_thread = threading.Thread(target=_thread_worker, daemon=True)
-            self.worker_thread.start()
-            return {"status": "ok", "message": "Harvest started"}
+    def download_selected(self, payload: dict) -> dict:
+        """Download papers the user ticked in the preview list."""
+        with self.lock:
+            if self.is_running:
+                return {"status": "error", "message": "A job is already running."}
+            ids = {str(i).lower() for i in (payload.get("ids") or [])}
+            chosen = [p for p in self.candidates if _paper_identifier(p) in ids and not p.pdf_path]
+            if not chosen:
+                return {"status": "error", "message": "Select at least one paper that is not downloaded yet."}
+            folder = Path(self.current_folder)
+            ctx = self._prepare("selected", folder, len(chosen),
+                                bool(payload.get("allow_scihub", ALLOW_SCIHUB_DEFAULT)))
+            ctx.kw_targets, ctx.kw_done = {}, {}
+            query_norm = self.last_query
+            self.phase = "downloading"
+            self.progress = PHASE_PROGRESS["downloading"]
+            self.status_text = f"Downloading {len(chosen)} selected paper(s)…"
+
+        def job():
+            global log_file_path
+            log_file_path = folder / "research_download.log"
+            download_papers(chosen, folder, len(chosen), ctx=ctx, query_norm=query_norm,
+                            balance_keywords=False, paper_callback=self._on_paper,
+                            progress_callback=self._on_progress, status_callback=self._on_status,
+                            phase_callback=self._set_phase)
+
+        self._launch(job, lambda: f"Done — {sum(1 for p in chosen if p.pdf_path)} of {len(chosen)} selected paper(s) saved.")
+        return {"status": "ok", "message": f"Downloading {len(chosen)} paper(s)"}
 
     def cancel(self) -> dict:
         with self.lock:
-            if self.ctx:
-                self.ctx.cancellation_event.set()
-            self.is_running = False
-            self.status_text = "Harvest cancelled by user."
-        _broadcast_sse({"type": "progress", "percent": self.progress, "phase": "cancelled", "message": "Harvest cancelled by user."})
-        return {"status": "ok", "message": "Harvest cancelled"}
+            if not self.is_running or not self.ctx:
+                return {"status": "ok", "message": "Nothing is running."}
+            self.ctx.cancellation_event.set()
+            self.status_text = "Cancelling — waiting for active downloads to stop…"
+            self.phase = "cancelling"
+        self._broadcast_progress()
+        return {"status": "ok", "message": "Cancelling…"}
+
+    # ── lookups ─────────────────────────────────────────────────────────────
+    def find_papers(self, ids: list[str] | None, scope: str) -> list[Paper]:
+        with self.lock:
+            pool = list(self.candidates) if scope == "candidates" else list(self.downloaded.values())
+        if ids:
+            wanted = {str(i).lower() for i in ids}
+            pool = [p for p in pool if _paper_identifier(p) in wanted]
+        return pool
+
+    def allowed_roots(self) -> list[Path]:
+        roots = {Path(self.current_folder).resolve(), get_default_save_folder().resolve()}
+        roots |= history_download_roots()
+        return list(roots)
+
+    def is_allowed_path(self, path_str: str, must_be_pdf: bool = False) -> Path | None:
+        """Only files/folders inside known download folders may be opened or served."""
+        if not path_str:
+            return None
+        try:
+            p = Path(path_str).expanduser().resolve()
+        except (OSError, RuntimeError):
+            return None
+        if must_be_pdf and p.suffix.lower() != ".pdf":
+            return None
+        if not p.exists():
+            return None
+        for root in self.allowed_roots():
+            if p == root or root in p.parents:
+                return p
+        return None
 
 web_controller = ResearchWebController()
+
+def _open_with_os(path: Path, reveal: bool = False):
+    """Open a file/folder with the OS handler (argument lists only: no shell parsing)."""
+    if sys.platform == "win32":
+        if reveal:
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        else:
+            os.startfile(str(path))
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)] if reveal else ["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent if reveal else path)])
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
 def create_flask_app():
     if not HAS_FLASK:
@@ -3795,180 +4367,229 @@ def create_flask_app():
 
     app = Flask("ArticlesDownloader", static_folder=None)
     app.config["JSON_AS_ASCII"] = False
+    try:
+        app.json.ensure_ascii = False   # Flask >= 2.2
+    except AttributeError:
+        pass
+    ctl = web_controller
+
+    @app.before_request
+    def _local_only_guard():
+        # 1) DNS-rebinding protection: the Host header must be loopback.
+        host = (request.host or "").rsplit(":", 1)[0] if not (request.host or "").startswith("[") \
+            else (request.host or "").split("]")[0] + "]"
+        if host not in _LOCAL_HOSTS:
+            abort(403)
+        # 2) Cross-site request protection: other websites must not drive this server.
+        origin = request.headers.get("Origin")
+        if origin and (urlparse(origin).hostname or "") not in _LOCAL_HOSTS:
+            abort(403)
+        if request.headers.get("Sec-Fetch-Site") == "cross-site":
+            abort(403)
+        # 3) State-changing calls must be JSON (forces a CORS pre-flight for any cross-origin caller).
+        if request.method == "POST" and not request.is_json:
+            abort(415)
 
     @app.after_request
-    def add_headers(resp):
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    def _headers(resp):
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["Referrer-Policy"] = "no-referrer"
+        resp.headers.setdefault("Cache-Control", "no-store")
         return resp
 
     @app.route("/")
     def index():
         ui_file = SCRIPT_DIR / "articles_ui.html"
         if ui_file.exists():
-            return ui_file.read_text(encoding="utf-8")
-        return "<h1>Articles Downloader v10 Ultra Pro</h1><p>articles_ui.html not found.</p>"
+            return Response(ui_file.read_text(encoding="utf-8"), mimetype="text/html")
+        return ("<h1>Articles Downloader</h1><p><code>articles_ui.html</code> is missing next to "
+                "Articles_v2.py. Re-download the project or run with <code>--tk</code> / <code>--cli</code>.</p>"), 500
+
+    @app.route("/favicon.ico")
+    def favicon():
+        ico = SCRIPT_DIR / "articles.ico"
+        return send_file(str(ico), mimetype="image/x-icon") if ico.exists() else ("", 204)
+
+    @app.route("/api/config")
+    def api_config():
+        return jsonify({
+            "app": APP_NAME, "version": APP_VERSION, "current_year": CURRENT_YEAR,
+            "default_folder": str(get_default_save_folder()), "max_articles": MAX_ARTICLES,
+            "sources": [{"key": k, "name": v[0]} for k, v in HARVESTER_REGISTRY.items()],
+            "stealth_engine": HAS_CFFI, "bs4": HAS_BS4,
+            "contact_email": CONTACT_EMAIL, "allow_scihub_default": ALLOW_SCIHUB_DEFAULT,
+            "has_s2_key": bool(S2_API_KEY), "has_core_key": bool(CORE_API_KEY),
+            "platform": sys.platform,
+        })
 
     @app.route("/api/status")
     def api_status():
-        return jsonify(web_controller.get_status_dict())
+        return jsonify(ctl.get_status_dict())
 
     @app.route("/api/start", methods=["POST"])
     def api_start():
-        data = request.get_json(silent=True) or {}
-        return jsonify(web_controller.start(data))
+        return jsonify(ctl.start(request.get_json(silent=True) or {}))
+
+    @app.route("/api/start_dois", methods=["POST"])
+    def api_start_dois():
+        return jsonify(ctl.start_dois(request.get_json(silent=True) or {}))
+
+    @app.route("/api/download_selected", methods=["POST"])
+    def api_download_selected():
+        return jsonify(ctl.download_selected(request.get_json(silent=True) or {}))
 
     @app.route("/api/cancel", methods=["POST"])
     def api_cancel():
-        return jsonify(web_controller.cancel())
+        return jsonify(ctl.cancel())
 
     @app.route("/api/papers")
     def api_papers():
-        with web_controller.lock:
-            return jsonify(list(web_controller.downloaded_papers))
+        return jsonify(ctl.get_status_dict()["papers"])
+
+    @app.route("/api/candidates")
+    def api_candidates():
+        with ctl.lock:
+            return jsonify([paper_to_dict(p, 0) for p in ctl.candidates])
+
+    @app.route("/api/cite", methods=["POST"])
+    def api_cite():
+        data = request.get_json(silent=True) or {}
+        fmt = str(data.get("fmt") or "apa").lower()
+        if fmt not in CITATION_FORMATS:
+            return jsonify({"status": "error", "message": "fmt must be bib, ris or apa"}), 400
+        papers = ctl.find_papers(data.get("ids"), str(data.get("scope") or "downloaded"))
+        if not papers:
+            return jsonify({"status": "error", "message": "No papers to cite yet."}), 404
+        return jsonify({"status": "ok", "count": len(papers), "text": format_citations(papers, fmt)})
 
     @app.route("/api/history")
     def api_history():
-        items = []
-        try:
-            conn = _history_conn()
-            rows = conn.execute("""
-                SELECT query, COUNT(DISTINCT identifier) as cnt, MAX(date) as last_date
-                FROM history
-                WHERE query IS NOT NULL AND query != ''
-                GROUP BY query
-                ORDER BY MAX(date) DESC, cnt DESC
-                LIMIT 40
-            """).fetchall()
-            conn.close()
-            for r in rows:
-                items.append({"query": r[0], "count": r[1], "date": r[2] or "Recent"})
-        except Exception as e:
-            items = []
-        return jsonify(items)
+        return jsonify(history_topics(request.args.get("q", ""), _to_int(request.args.get("limit"), 60, 1, 500)))
+
+    @app.route("/api/history/papers")
+    def api_history_papers():
+        return jsonify(history_papers(request.args.get("query", "")))
+
+    @app.route("/api/history/delete", methods=["POST"])
+    def api_history_delete():
+        q = str((request.get_json(silent=True) or {}).get("query") or "")
+        return jsonify({"status": "ok", "deleted": delete_history(q)})
 
     @app.route("/api/browse_folder", methods=["POST"])
     def api_browse_folder():
-        folder = choose_folder_dialog(web_controller.current_folder)
-        return jsonify({"folder": folder})
+        data = request.get_json(silent=True) or {}
+        return jsonify({"folder": choose_folder_dialog(str(data.get("initial") or ctl.current_folder))})
 
     @app.route("/api/open_folder", methods=["POST"])
     def api_open_folder():
         data = request.get_json(silent=True) or {}
-        folder_str = data.get("folder") or web_controller.current_folder
-        if folder_str and os.path.isdir(folder_str):
-            try:
-                if sys.platform == "win32":
-                    os.startfile(folder_str)
-                else:
-                    subprocess.Popen(["xdg-open", folder_str])
-                return jsonify({"status": "ok"})
-            except Exception as e:
-                return jsonify({"status": "error", "message": str(e)}), 500
-        return jsonify({"status": "error", "message": "Directory does not exist"}), 400
+        folder_str = str(data.get("folder") or ctl.current_folder)
+        p = Path(folder_str).expanduser()
+        if not p.is_dir():
+            return jsonify({"status": "error", "message": "That folder does not exist yet."}), 400
+        try:
+            _open_with_os(p)
+            return jsonify({"status": "ok"})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    def _open_path_endpoint(reveal: bool):
+        data = request.get_json(silent=True) or {}
+        p = ctl.is_allowed_path(str(data.get("path") or ""), must_be_pdf=True)
+        if not p:
+            return jsonify({"status": "error", "message": "PDF not found in your download folders."}), 404
+        try:
+            _open_with_os(p, reveal=reveal)
+            return jsonify({"status": "ok"})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
 
     @app.route("/api/open_pdf", methods=["POST"])
     def api_open_pdf():
-        data = request.get_json(silent=True) or {}
-        path = data.get("path")
-        if path and os.path.exists(path):
-            try:
-                if sys.platform == "win32":
-                    os.startfile(path)
-                else:
-                    subprocess.Popen(["xdg-open", path])
-                return jsonify({"status": "ok"})
-            except Exception as e:
-                return jsonify({"status": "error", "message": str(e)}), 500
-        return jsonify({"status": "error", "message": "PDF file does not exist"}), 404
+        return _open_path_endpoint(reveal=False)
 
     @app.route("/api/reveal_pdf", methods=["POST"])
     def api_reveal_pdf():
-        data = request.get_json(silent=True) or {}
-        path = data.get("path")
-        if path and os.path.exists(path):
-            try:
-                if sys.platform == "win32":
-                    subprocess.Popen(f'explorer /select,"{path}"')
-                else:
-                    subprocess.Popen(["xdg-open", str(Path(path).parent)])
-                return jsonify({"status": "ok"})
-            except Exception as e:
-                return jsonify({"status": "error", "message": str(e)}), 500
-        return jsonify({"status": "error", "message": "File does not exist"}), 404
+        return _open_path_endpoint(reveal=True)
 
     @app.route("/api/pdf_file")
     def api_pdf_file():
-        path = request.args.get("path", "")
-        if path and os.path.exists(path) and path.lower().endswith(".pdf"):
-            return send_file(path, mimetype="application/pdf")
-        return "PDF file not found", 404
+        p = ctl.is_allowed_path(request.args.get("path", ""), must_be_pdf=True)
+        if not p:
+            return "PDF file not found", 404
+        return send_file(str(p), mimetype="application/pdf")
 
     @app.route("/api/export/<fmt>")
     def api_export(fmt):
-        folder_str = request.args.get("folder") or web_controller.current_folder
-        folder = Path(folder_str) if folder_str else get_default_save_folder()
-        fname_map = {
-            "bib": "references.bib",
-            "ris": "references.ris",
-            "apa": "references_APA.txt",
-            "csv": "results.csv",
-            "json": "corpus_metadata.json",
-        }
+        fname_map = {"bib": "references.bib", "ris": "references.ris", "apa": "references_APA.txt",
+                     "csv": "results.csv", "json": "corpus_metadata.json"}
         target_name = fname_map.get(fmt.lower())
-        if target_name:
-            file_path = folder / target_name
-            if file_path.exists():
-                return send_file(str(file_path), as_attachment=True, download_name=target_name)
-        return "Requested export file does not exist in destination folder yet.", 404
+        if not target_name:
+            return "Unknown export format", 404
+        folder = Path(ctl.current_folder)
+        file_path = folder / target_name
+        if file_path.exists():
+            return send_file(str(file_path), as_attachment=True, download_name=target_name)
+        # Nothing written yet (e.g. preview only): render citations on the fly.
+        if fmt.lower() in CITATION_FORMATS:
+            papers = ctl.find_papers(None, "downloaded") or ctl.find_papers(None, "candidates")
+            if papers:
+                return Response(format_citations(papers, fmt.lower()), mimetype="text/plain",
+                                headers={"Content-Disposition": f'attachment; filename="{target_name}"'})
+        return "Nothing to export yet — download some papers first.", 404
 
     @app.route("/api/stream")
     def api_stream():
         def event_stream():
-            q = queue.Queue(maxsize=1000)
+            q = queue.Queue(maxsize=2000)
             with _subscribers_lock:
                 _sse_subscribers.append(q)
             try:
-                init_event = {"type": "progress", "percent": web_controller.progress,
-                              "phase": web_controller.phase, "message": web_controller.status_text}
-                yield f"data: {json.dumps(init_event)}\n\n"
+                yield "retry: 2000\n\n"
+                yield f"data: {json.dumps({'type': 'progress', **ctl.get_status_dict(False)})}\n\n"
                 while True:
                     try:
-                        ev = q.get(timeout=25.0)
-                        yield f"data: {json.dumps(ev)}\n\n"
+                        ev = q.get(timeout=20.0)
+                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                     except queue.Empty:
-                        yield f": heartbeat\n\n"
+                        yield ": heartbeat\n\n"
             finally:
                 with _subscribers_lock:
                     if q in _sse_subscribers:
                         _sse_subscribers.remove(q)
 
-        return Response(event_stream(), mimetype="text/event-stream")
+        return Response(event_stream(), mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     return app
 
 def choose_folder_dialog(initial_dir=""):
-    """Native Windows folder browser dialog without leaving background windows."""
+    """Native folder picker (Windows: WinForms via PowerShell; else Tk). Returns the
+    initial folder unchanged if the user cancels."""
     init_path = initial_dir or str(get_default_save_folder())
-    cmd = (
-        'Add-Type -AssemblyName System.Windows.Forms;'
-        '$f = New-Object System.Windows.Forms.FolderBrowserDialog;'
-        '$f.Description = "Select Research PDF Save Directory";'
-        f'$f.SelectedPath = "{init_path}";'
-        'if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }'
-    )
-    try:
-        res = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=30)
-        p = res.stdout.strip()
-        if p and os.path.isdir(p):
-            return p
-    except Exception:
-        pass
+    if sys.platform == "win32":
+        # The path travels in an environment variable, never inside the script text,
+        # so quotes or $() in a folder name cannot inject PowerShell code.
+        cmd = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$f = New-Object System.Windows.Forms.FolderBrowserDialog;"
+            "$f.Description = 'Select the folder for downloaded PDFs';"
+            "$f.SelectedPath = $env:AD_INIT_DIR;"
+            "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }"
+        )
+        try:
+            res = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", cmd],
+                                 capture_output=True, text=True, timeout=300,
+                                 env={**os.environ, "AD_INIT_DIR": init_path})
+            p = res.stdout.strip()
+            if p and os.path.isdir(p):
+                return p
+            return init_path
+        except Exception:
+            pass
     if HAS_TKINTER:
         try:
-            import tkinter as tk
-            from tkinter import filedialog
             root = tk.Tk()
             root.withdraw()
             root.attributes("-topmost", True)
@@ -3984,29 +4605,36 @@ def find_available_port(start_port: int = 5080) -> int:
     import socket
     for port in range(start_port, start_port + 50):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(('127.0.0.1', port)) != 0:
+            try:
+                s.bind(("127.0.0.1", port))
                 return port
+            except OSError:
+                continue
     return start_port
 
 def launch_native_window(url: str):
-    """Launch the Web App in standalone native application window mode."""
-    edge_paths = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]
-    chrome_paths = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]
-    for exe in edge_paths + chrome_paths:
-        if os.path.exists(exe):
+    """Open the UI as a chromeless app window (Edge/Chrome --app) or a browser tab."""
+    candidates = []
+    if sys.platform == "win32":
+        pf = [os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+              os.environ.get("ProgramFiles", r"C:\Program Files"),
+              os.environ.get("LOCALAPPDATA", "")]
+        for base in filter(None, pf):
+            candidates += [os.path.join(base, r"Microsoft\Edge\Application\msedge.exe"),
+                           os.path.join(base, r"Google\Chrome\Application\chrome.exe")]
+    elif sys.platform == "darwin":
+        candidates += ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                       "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
+    else:
+        import shutil
+        for name in ("google-chrome", "chromium", "chromium-browser", "microsoft-edge"):
+            exe = shutil.which(name)
+            if exe:
+                candidates.append(exe)
+    for exe in candidates:
+        if exe and os.path.exists(exe):
             try:
-                subprocess.Popen([
-                    exe,
-                    f"--app={url}",
-                    "--window-size=1360,920",
-                    "--new-window",
-                ])
+                subprocess.Popen([exe, f"--app={url}", "--window-size=1440,940", "--new-window"])
                 return True
             except Exception:
                 pass
@@ -4014,111 +4642,171 @@ def launch_native_window(url: str):
     webbrowser.open(url)
     return True
 
-def run_web_app(port: int = 5080, open_window: bool = True):
-    """Run local Flask server and launch the native desktop application window."""
+def run_web_app(port: int = 5080, open_window: bool = True, open_browser: bool = True):
+    """Run the local-only web server and open the app window."""
     app = create_flask_app()
     if not app:
-        print("Flask is not installed. Falling back to Tkinter GUI.")
+        print("Flask is not installed (pip install flask). Falling back to the Tkinter GUI.")
         if HAS_TKINTER:
             ResearchAppDashboard().root.mainloop()
         return
 
     actual_port = find_available_port(port)
     url = f"http://127.0.0.1:{actual_port}"
-    print(f"\n⚡ Articles Downloader v10 Ultra Pro — Obsidian 4K UI Server")
-    print(f"  🔗 Local Loopback: {url}")
+    print(f"\n⚡ {APP_NAME} v{APP_VERSION} — local web app")
+    print(f"  🔗 {url}   (Ctrl+C to quit)")
 
-    if open_window:
+    if open_browser:
         def _delayed_launch():
             time.sleep(0.8)
-            launch_native_window(url)
+            if open_window:
+                launch_native_window(url)
+            else:
+                import webbrowser
+                webbrowser.open(url)
         threading.Thread(target=_delayed_launch, daemon=True).start()
 
-    # Run loopback server
     import logging
-    log = logging.getLogger('werkzeug')
-    log.setLevel(logging.ERROR)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
     app.run(host="127.0.0.1", port=actual_port, threaded=True, debug=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CLI ARGUMENT PARSER & MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Articles Downloader v10 Ultra Pro — High-Performance Research Literature Harvester",
+        prog="Articles_v2.py",
+        description=f"{APP_NAME} v{APP_VERSION} — search 9 scholarly sources, rank by journal "
+                    "quartile, download PDFs and export citations.",
+        epilog="Examples:\n"
+               '  python Articles_v2.py                                   # desktop web app\n'
+               '  python Articles_v2.py -k "zinc air battery" -m 20       # headless download\n'
+               '  python Articles_v2.py -k "LATP" -f "solid electrolyte" --preview\n'
+               '  python Articles_v2.py --doi 10.1038/s41586-020-2649-2 --doi 10.3390/ma14010001\n'
+               '  python Articles_v2.py --doi-file my_dois.txt -o ./pdfs',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--keywords", "-k", type=str, help="Research topic or long title to harvest")
-    parser.add_argument("--focus", "-f", type=str, default="", help="Sub-focus or specific methodology")
-    parser.add_argument("--start-year", "-y1", type=str, default="2023", help="Start publication year")
-    parser.add_argument("--end-year", "-y2", type=str, default="2026", help="End publication year")
-    parser.add_argument("--max", "-m", type=int, default=50, help="Maximum number of PDFs to download")
-    parser.add_argument("--folder", "-o", type=str, default="", help="Destination directory for downloads")
-    parser.add_argument("--quartiles", "-q", choices=["q1_q2", "all_ranked", "all"], default="all_ranked",
-                        help="Quartile filter: q1_q2, all_ranked (Q1-Q4), or all")
-    parser.add_argument("--sort", "-s", choices=["quartile_cits", "citations", "newest"], default="quartile_cits",
-                        help="Sorting strategy")
-    parser.add_argument("--mode", choices=["fresh", "incremental"], default="fresh", help="Fresh or Incremental search")
-    parser.add_argument("--min-relevance", "-r", type=float, default=DEFAULT_MIN_RELEVANCE,
-                        help="Minimum relevance match threshold between 0.0 and 1.0 (default: 0.60 for 60%%)")
-    parser.add_argument("--cli", "--no-gui", action="store_true", help="Run in headless command-line mode without GUI")
-    parser.add_argument("--tk", action="store_true", help="Run classic Tkinter GUI instead of modern Web App")
-    parser.add_argument("--web", action="store_true", help="Run Web App in browser tab rather than app window")
-    parser.add_argument("--port", type=int, default=5080, help="Local server port (default: 5080)")
-    parser.add_argument("--no-browser", action="store_true", help="Do not open browser/window automatically")
-    return parser.parse_args()
+    g = parser.add_argument_group("topic search")
+    g.add_argument("--keywords", "--query", "-k", type=str, help="Research topic or long title to harvest")
+    g.add_argument("--focus", "-f", type=str, default="", help="Sub-focus or specific methodology")
+    g.add_argument("--start-year", "-y1", type=str, default=str(CURRENT_YEAR - 3), help="Start publication year")
+    g.add_argument("--end-year", "-y2", type=str, default=str(CURRENT_YEAR), help="End publication year")
+    g.add_argument("--max", "-m", type=int, default=50, help=f"Maximum PDFs to download (1-{MAX_ARTICLES})")
+    g.add_argument("--quartiles", "-q", choices=list(QUARTILE_FILTERS), default="all_ranked",
+                   help="Journal filter: q1_q2, all_ranked (Q1-Q4) or all (incl. preprints/unranked)")
+    g.add_argument("--sort", "-s", choices=list(SORT_STRATEGIES), default="quartile_cits", help="Ranking order")
+    g.add_argument("--mode", choices=["fresh", "incremental"], default="fresh",
+                   help="incremental skips papers already downloaded for the same topic")
+    g.add_argument("--min-relevance", "-r", type=float, default=DEFAULT_MIN_RELEVANCE,
+                   help="Minimum relevance match 0.0-1.0 (default: 0.60 = 60%%)")
+    g.add_argument("--sources", type=str, default="",
+                   help="Comma-separated sources (default: all). See --list-sources")
+    g.add_argument("--preview", action="store_true", help="Only list the ranked candidates; download nothing")
 
-def main():
-    args = parse_args()
+    d = parser.add_argument_group("DOI list")
+    d.add_argument("--doi", action="append", default=[], help="Download this DOI (repeatable)")
+    d.add_argument("--doi-file", type=str, help="Text file with DOIs (any layout; one per line is fine)")
 
-    # 1. Headless CLI mode
-    if args.cli or (args.keywords and not (HAS_FLASK or HAS_TKINTER)):
-        if not args.keywords:
-            print("Error: --keywords is required when running in CLI mode.")
-            sys.exit(1)
-        save_dir = Path(args.folder) if args.folder else get_default_save_folder()
-        ctx = DownloadContext(1, args.max, save_dir)
-        execute_research_workflow(
-            keywords=args.keywords,
-            focus=args.focus,
-            year_start=args.start_year,
-            year_end=args.end_year,
-            max_articles=args.max,
-            save_folder=save_dir,
-            quartile_filter=args.quartiles,
-            sort_strategy=args.sort,
-            mode=args.mode,
-            min_relevance=args.min_relevance,
-            ctx=ctx,
-        )
+    o = parser.add_argument_group("output & network")
+    o.add_argument("--folder", "-o", type=str, default="", help="Destination directory for downloads")
+    o.add_argument("--email", type=str, default="", help="Contact e-mail for API polite pools")
+    o.add_argument("--allow-scihub", action="store_true",
+                   help="Enable the Sci-Hub fallback (off by default; check local law/policy)")
+
+    u = parser.add_argument_group("interface")
+    u.add_argument("--cli", "--no-gui", action="store_true", help="Headless command-line mode")
+    u.add_argument("--tk", action="store_true", help="Classic Tkinter GUI instead of the web app")
+    u.add_argument("--web", action="store_true", help="Open the web app in a normal browser tab")
+    u.add_argument("--port", type=int, default=5080, help="Local server port (default: 5080)")
+    u.add_argument("--no-browser", action="store_true", help="Start the server without opening a window")
+    u.add_argument("--list-sources", action="store_true", help="List available scholarly sources and exit")
+    u.add_argument("--history", action="store_true", help="Print past topics from the local history and exit")
+    return parser.parse_args(argv)
+
+def _print_preview(papers: list[Paper], limit: int):
+    if not papers:
+        print("\nNo candidates to show.")
         return
+    print(f"\n{'#':>3}  {'Q':<8} {'Match':>5} {'Cites':>6} {'Year':<4}  Title")
+    print("─" * 100)
+    for i, p in enumerate(papers[:limit], 1):
+        print(f"{i:>3}  {p.quartile or '—':<8} {int(p.relevance_score * 100):>4}% {p.citations:>6} "
+              f"{(p.year or '—'):<4}  {clean_title(p.title)[:70]}")
+        if p.doi:
+            print(f"{'':>30}https://doi.org/{p.clean_doi()}")
+    if len(papers) > limit:
+        print(f"… and {len(papers) - limit} more (raise --max to list more)")
 
-    # 2. Classic Tkinter GUI mode (if explicitly requested with --tk)
+def main(argv=None):
+    global CONTACT_EMAIL
+    args = parse_args(argv)
+    if args.email:
+        CONTACT_EMAIL = args.email.strip()
+
+    if args.list_sources:
+        for k, (name, _fn, _cap) in HARVESTER_REGISTRY.items():
+            print(f"  {k:<16} {name}")
+        return 0
+    if args.history:
+        topics = history_topics(limit=200)
+        if not topics:
+            print("No history yet.")
+        for t in topics:
+            print(f"  {t['date']:<17} {t['count']:>4} PDF(s)  {t['query']}")
+        return 0
+
+    dois = list(args.doi)
+    if args.doi_file:
+        try:
+            dois += parse_doi_list(Path(args.doi_file).read_text(encoding="utf-8", errors="ignore"))
+        except OSError as e:
+            print(f"Error: cannot read --doi-file: {e}")
+            return 2
+
+    headless = args.cli or ((args.keywords or dois) and not args.tk)
+    if headless:
+        save_dir = Path(args.folder).expanduser() if args.folder else get_default_save_folder()
+        if dois:
+            ctx = DownloadContext(1, len(dois), save_dir, allow_scihub=args.allow_scihub)
+            got = execute_doi_workflow(dois, save_dir, ctx=ctx)
+            return 0 if got else 1
+        if not args.keywords:
+            print("Error: --keywords (or --doi) is required in CLI mode.")
+            return 2
+        max_n = max(1, min(args.max, MAX_ARTICLES))
+        ctx = DownloadContext(1, max_n, save_dir, allow_scihub=args.allow_scihub)
+        result = execute_research_workflow(
+            keywords=args.keywords, focus=args.focus, year_start=args.start_year, year_end=args.end_year,
+            max_articles=max_n, save_folder=save_dir, quartile_filter=args.quartiles,
+            sort_strategy=args.sort, mode=args.mode,
+            min_relevance=max(0.0, min(1.0, args.min_relevance)), ctx=ctx,
+            sources=resolve_sources(args.sources), download=not args.preview,
+        )
+        if args.preview:
+            _print_preview(result, max_n)
+        return 0 if result else 1
+
+    # Classic Tkinter GUI mode (explicitly requested with --tk)
     if args.tk and HAS_TKINTER:
         app = ResearchAppDashboard()
-        if args.keywords:
-            app.ent_keywords.delete(0, "end")
-            app.ent_keywords.insert(0, args.keywords)
-        if args.focus:
-            app.ent_focus.delete(0, "end")
-            app.ent_focus.insert(0, args.focus)
-        if args.folder:
-            app.ent_folder.delete(0, "end")
-            app.ent_folder.insert(0, args.folder)
+        for widget, value in ((app.ent_keywords, args.keywords), (app.ent_focus, args.focus),
+                              (app.ent_folder, args.folder)):
+            if value:
+                widget.delete(0, "end")
+                widget.insert(0, value)
         app.root.mainloop()
-        return
+        return 0
 
-    # 3. Next-Gen Obsidian 4K Modern UI (Default for desktop launcher & interactive use)
+    # Default: local web app in a native app window
     if HAS_FLASK:
-        run_web_app(
-            port=args.port,
-            open_window=not args.no_browser and not args.web
-        )
+        run_web_app(port=args.port, open_window=not args.web, open_browser=not args.no_browser)
     elif HAS_TKINTER:
-        app = ResearchAppDashboard()
-        app.root.mainloop()
+        ResearchAppDashboard().root.mainloop()
     else:
-        print("Neither Flask nor Tkinter is available. Please run with --cli flag.")
+        print("Neither Flask nor Tkinter is available. Install Flask (pip install flask) or use --cli.")
+        return 1
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

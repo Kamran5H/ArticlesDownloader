@@ -1,0 +1,8 @@
+# Core (required)
+requests>=2.31
+urllib3>=1.26
+beautifulsoup4>=4.12
+flask>=2.3          # local web app (default UI); without it the Tkinter GUI / --cli still work
+
+# Optional: browser-grade TLS fingerprints -> fewer publisher download blocks
+curl_cffi>=0.7

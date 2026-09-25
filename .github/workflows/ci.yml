@@ -1,25 +1,43 @@
-name: CI Quality Gate
+name: CI
 
 on:
   push:
     branches: [ main, master ]
   pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
-  build-and-validate:
-    runs-on: ubuntu-latest
+  test:
+    name: Tests (Python ${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python: "3.12"
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python }}
+          cache: pip
 
-      - name: Validate Python Syntax
+      - name: Install dependencies
         run: |
-          python -m compileall -q .
-          echo "All Python source files passed compilation successfully!"
+          python -m pip install --upgrade pip
+          pip install requests urllib3 beautifulsoup4 flask pytest ruff
+
+      - name: Lint (syntax errors, undefined names, likely bugs)
+        run: ruff check --select E9,F,B --ignore B008,B905 Articles_v2.py tests
+
+      - name: Unit, workflow and web API tests (offline)
+        run: python -m pytest
+
+      - name: CLI smoke test
+        run: |
+          python Articles_v2.py --help
+          python Articles_v2.py --list-sources

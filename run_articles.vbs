@@ -10,6 +10,12 @@ appDir = fso.GetParentFolderName(WScript.ScriptFullName)
 logPath = appDir & "\launch.log"
 sh.CurrentDirectory = appDir
 
+' First run (or the icon was deleted): put the shortcut on the desktop.
+If Not fso.FileExists(sh.SpecialFolders("Desktop") & "\Articles Downloader.lnk") _
+   And fso.FileExists(appDir & "\Install Desktop Shortcut.vbs") Then
+  sh.Run "wscript //nologo " & q & appDir & "\Install Desktop Shortcut.vbs" & q & " /quiet", 0, False
+End If
+
 ' Prefer a local virtual environment, then the Python launcher, then python on PATH.
 py = ""
 candidates = Array(appDir & "\.venv\Scripts\python.exe", appDir & "\venv\Scripts\python.exe")

@@ -24,7 +24,9 @@
 | 🏆 **Journal quality ranking** | Every paper is matched to the bundled SCImago table (ISSN, title and abbreviations such as *Adv. Energy Mater.*) and badged Q1–Q4. Filter to Q1–Q2, Q1–Q4 or everything. |
 | 👀 **Preview before download** | Rank the candidates first, tick exactly the papers you want, then download them. |
 | #️⃣ **DOI list mode** | Paste any list of DOIs or doi.org links and download those exact papers with full metadata. |
-| ⬇️ **Multi-tier PDF retrieval** | Publisher direct-PDF patterns → harvested open-access links → Unpaywall → landing-page scraper. 12 parallel workers, per-keyword balancing for long titles. |
+| ⬇️ **Multi-tier PDF retrieval** | Publisher direct-PDF patterns → harvested open-access links → Unpaywall → landing-page scraper. Up to 12 parallel workers, per-keyword balancing for long titles. |
+| 🥇 **Best-ranked first** | Asking for 25 PDFs gives you the 25 best-ranked papers that can be downloaded: a lower-ranked paper is saved only when the ones above it fail, even though several are fetched at once. |
+| 🛡 **Safe files** | Every PDF is checked to be complete (cut-off downloads are rejected), written atomically, capped at 120 MB while streaming, and re-running a topic reuses identical files instead of saving `Title_1.pdf` copies. |
 | 📝 **Citations** | `references.bib`, `references.ris` (Zotero/EndNote/Mendeley), APA 7, Excel-ready CSV and a JSON corpus, plus one-click copy of APA/BibTeX for any paper. |
 | 🗂 **History** | A local SQLite history powers *incremental mode* (skip what you already have) and a searchable History tab where you can reopen PDFs, re-run a topic or forget it. |
 | 🖥 **Modern local UI** | Light/dark themes, live progress, sortable/filterable results, paper details with abstracts, live console, keyboard shortcuts. A classic Tkinter GUI and a headless CLI are also included. |
@@ -71,7 +73,7 @@ pip install -r requirements.txt
 python Articles_v2.py
 ```
 
-This starts a server on `127.0.0.1` and opens the app in a chromeless Edge/Chrome window, or your browser if neither is found. On Windows you can double-click **`run_articles.vbs`** to launch it without a console window. Startup errors go to `launch.log`.
+This starts a server on `127.0.0.1` and opens the app in a chromeless Edge/Chrome window, or your browser if neither is found. On Windows you can double-click **`run_articles.vbs`** to launch it without a console window. Double-click **`Install Desktop Shortcut.vbs`** once to put an *Articles Downloader* icon on your desktop (it also repairs older shortcuts after the folder is moved; the launcher recreates the icon if it goes missing). Startup errors go to `launch.log`.
 
 1. Type a topic or a full paper title (long titles are split into keyword groups automatically).
 2. Optionally add a **Focus**, pick years, the number of PDFs, the journal quality and the ranking.
@@ -181,6 +183,7 @@ ArticlesDownloader/
 ├── articles_ui.html      # web user interface (served locally)
 ├── scimago_ranks.csv     # SCImago journal ranks (ISSN, title, quartile)
 ├── run_articles.vbs      # silent Windows launcher
+├── Install Desktop Shortcut.vbs   # creates or repairs the desktop icon
 ├── articles.ico          # app icon
 ├── tests/                # pytest suite
 ├── extras/               # unrelated helper scripts kept for reference

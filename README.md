@@ -73,7 +73,7 @@ pip install -r requirements.txt
 python Articles_v2.py
 ```
 
-This starts a server on `127.0.0.1` and opens the app in a chromeless Edge/Chrome window, or your browser if neither is found. On Windows you can double-click **`run_articles.vbs`** to launch it without a console window. Startup errors go to `launch.log`.
+This starts a server on `127.0.0.1` and opens the app in a chromeless Edge/Chrome window, or your browser if neither is found. On Windows you can double-click **`run_articles.vbs`** to launch it without a console window. Double-click **`Install Desktop Shortcut.vbs`** once to put an *Articles Downloader* icon on your desktop (it also repairs older shortcuts after the folder is moved; the launcher recreates the icon if it goes missing). Startup errors go to `launch.log`.
 
 1. Type a topic or a full paper title (long titles are split into keyword groups automatically).
 2. Optionally add a **Focus**, pick years, the number of PDFs, the journal quality and the ranking.
@@ -183,6 +183,7 @@ ArticlesDownloader/
 ├── articles_ui.html      # web user interface (served locally)
 ├── scimago_ranks.csv     # SCImago journal ranks (ISSN, title, quartile)
 ├── run_articles.vbs      # silent Windows launcher
+├── Install Desktop Shortcut.vbs   # creates or repairs the desktop icon
 ├── articles.ico          # app icon
 ├── tests/                # pytest suite
 ├── extras/               # unrelated helper scripts kept for reference

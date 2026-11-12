@@ -270,6 +270,7 @@ class DownloadContext:
         # Ranks of papers being downloaded right now (see wait_for_better_ranked).
         self.rank_changed = threading.Condition(self.lock)
         self.in_flight_ranks: set[int] = set()
+        self.ready_ranks: set[int] = set()          # finished, waiting for their turn to be saved
 
     def start_rank(self, rank: int | None):
         if rank is not None:
@@ -288,18 +289,32 @@ class DownloadContext:
         Several papers are fetched at once for speed. Without this, a fast
         site ranked 9th could take a slot that the slower paper ranked 2nd was
         about to fill. A paper may be saved only while the open slots outnumber
-        the better-ranked papers still in progress. Must be called with
-        ``self.lock`` held (it waits on the lock's condition)."""
+        the better-ranked papers that could still claim them:
+
+        * better-ranked papers that are also finished and waiting always go
+          first (no time limit: they are saved within moments);
+        * better-ranked papers still downloading are waited for up to
+          `timeout` seconds, so one hung site cannot block the run.
+
+        Must be called with ``self.lock`` held (it waits on the lock's condition)."""
         if rank is None:
             return
         deadline = time.monotonic() + timeout
-        while not self.cancellation_event.is_set():
-            open_slots = self.target_downloads - self.successful_downloads
-            better = sum(1 for r in self.in_flight_ranks if r < rank)
-            remaining = deadline - time.monotonic()
-            if open_slots <= 0 or better < open_slots or remaining <= 0:
-                return
-            self.rank_changed.wait(min(remaining, 0.5))
+        self.ready_ranks.add(rank)
+        try:
+            while not self.cancellation_event.is_set():
+                open_slots = self.target_downloads - self.successful_downloads
+                if open_slots <= 0:
+                    return
+                better_ready = sum(1 for r in self.ready_ranks if r < rank)
+                better_busy = sum(1 for r in self.in_flight_ranks if r < rank and r not in self.ready_ranks)
+                remaining = deadline - time.monotonic()
+                if better_ready < open_slots and (better_ready + better_busy < open_slots or remaining <= 0):
+                    return
+                self.rank_changed.wait(0.5 if better_ready >= open_slots else max(0.01, min(remaining, 0.5)))
+        finally:
+            self.ready_ranks.discard(rank)
+            self.rank_changed.notify_all()
 
     def _at_capacity(self, keyword: str | None) -> bool:
         if self.successful_downloads >= self.target_downloads:
@@ -3100,6 +3115,10 @@ def download_papers(
             limit = min(MAX_WORKERS, remaining + DOWNLOAD_LOOKAHEAD) if remaining > 0 else 0
             while pending and len(futures) < limit and not ctx.cancellation_event.is_set():
                 item = pending.popleft()
+                # Register the rank now, not when a worker thread picks the job
+                # up: otherwise a lower-ranked paper that finishes first sees
+                # no better-ranked paper "in progress" and takes its slot.
+                ctx.start_rank(item[7])
                 futures[executor.submit(download_article, item)] = item
 
         try:
@@ -3121,6 +3140,9 @@ def download_papers(
             # Do not wait for requests still in progress: once the target is met
             # (or the run is cancelled) they can no longer save anything, and
             # waiting kept a finished run "busy" for up to a request timeout.
+            for future, item in futures.items():
+                if future.cancel():                  # never started: release its rank
+                    ctx.finish_rank(item[7])
             executor.shutdown(wait=False, cancel_futures=True)
 
     # Pass 1: Balanced across keywords

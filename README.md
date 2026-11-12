@@ -35,7 +35,7 @@
 
 | Key | Source | Coverage | Notes |
 | --- | --- | --- | --- |
-| `openalex` | OpenAlex | 250 M+ works, all fields | abstracts, concepts, OA locations |
+| `openalex` | OpenAlex | 250 M+ works, all fields | abstracts, concepts, OA locations; a free `OPENALEX_API_KEY` is recommended (see below) |
 | `crossref` | Crossref | 150 M+ DOIs | bibliographic matching |
 | `europepmc` | Europe PMC | life sciences, full-text OA | direct PMC PDFs |
 | `pubmed` | PubMed Central (NCBI E-utilities) | biomedical & materials | |
@@ -45,7 +45,7 @@
 | `core` | CORE | open repositories | needs a free `CORE_API_KEY` |
 | `base` | BASE (Bielefeld) | academic repositories | only answers IP-whitelisted clients |
 
-No keys are needed for the default sources. Metadata requests identify themselves with a contact e-mail so they land in the APIs’ polite pools. Set yours with `ARTICLES_CONTACT_EMAIL` or `--email`.
+No keys are needed to get results. **OpenAlex** now meters requests: without a key they come from a small daily budget shared by everyone on your network address, and when it runs out the app says so and carries on with the other sources. A key is free: create an account at [openalex.org](https://openalex.org), copy the API key from your settings and set `OPENALEX_API_KEY`. Whenever a source cannot be searched, the run log names it and the reason. Metadata requests identify themselves with a contact e-mail so they land in the APIs’ polite pools. Set yours with `ARTICLES_CONTACT_EMAIL` or `--email`.
 
 ## 📦 Installation
 
@@ -128,7 +128,7 @@ python Articles_v2.py --list-sources   # source keys
 | `--cli` / `--tk` / `--web` | — | Force headless / Tkinter / browser-tab mode |
 | `--port`, `--no-browser` | 5080 | Local server port; start without opening a window |
 
-**Environment variables:** `ARTICLES_CONTACT_EMAIL`, `S2_API_KEY`, `CORE_API_KEY`, `ARTICLES_ALLOW_SCIHUB=1`.
+**Environment variables:** `ARTICLES_CONTACT_EMAIL`, `OPENALEX_API_KEY`, `S2_API_KEY`, `CORE_API_KEY`, `ARTICLES_ALLOW_SCIHUB=1`.
 
 ## 📁 What you get
 

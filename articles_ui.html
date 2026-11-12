@@ -719,7 +719,8 @@ function initForm(cfg) {
   $("#engineInfo").innerHTML =
     `<b>Engine</b><br>Download client: ${cfg.stealth_engine ? "curl_cffi (browser TLS fingerprint)" : "requests"}` +
     `<br>Polite-pool contact: ${esc(cfg.contact_email)}` +
-    `<br>Semantic Scholar key: ${cfg.has_s2_key ? "set" : "not set"} · CORE key: ${cfg.has_core_key ? "set" : "not set"}`;
+    `<br>OpenAlex key: ${cfg.has_openalex_key ? "set" : "not set (free; needed once the shared daily budget runs out)"}`
+    + `<br>Semantic Scholar key: ${cfg.has_s2_key ? "set" : "not set"} · CORE key: ${cfg.has_core_key ? "set" : "not set"}`;
   ["keywords", "focus", "y1", "y2", "maxArticles", "sort", "incremental", "folder"].forEach(id => $("#" + id).addEventListener("change", saveForm));
   $("#keywords").addEventListener("input", saveForm);
   $("#relevance").oninput = () => { $("#relVal").textContent = $("#relevance").value + "%"; saveForm(); };

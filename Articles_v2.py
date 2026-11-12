@@ -93,7 +93,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import requests
 from glob import escape as glob_escape
-from urllib.parse import urlparse, urljoin, quote
+from urllib.parse import parse_qsl, urlparse, urljoin, quote
 
 # Optional high-performance / stealth libraries
 try:
@@ -122,7 +122,7 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 
 APP_NAME        = "Articles Downloader"
-APP_VERSION     = "11.1"
+APP_VERSION     = "11.2"
 
 MAX_ARTICLES    = 500
 MAX_WORKERS     = 12          # Concurrency: gentle on scholarly APIs
@@ -133,11 +133,15 @@ RANK_WAIT_SECONDS = 60        # Longest a finished download waits for better-ran
 MAX_BACKOFF_S   = 25          # Maximum back-off sleep time
 MAX_PDF_BYTES   = 120 * 1024 * 1024  # Refuse absurdly large "PDFs" (protects RAM)
 DEFAULT_MIN_RELEVANCE = 0.60  # Default 60% minimum relevance matching
+FULL_MATCH = 0.95             # Relevance at or above this counts as matching the whole query
 
 # Contact address sent to OpenAlex / Crossref / Unpaywall "polite pools".
 # Override with the ARTICLES_CONTACT_EMAIL environment variable or --email.
 CONTACT_EMAIL   = os.environ.get("ARTICLES_CONTACT_EMAIL", "chkam.dev@gmail.com")
 # Optional API keys: raise rate limits (Semantic Scholar) or unlock the API (CORE v3).
+# OpenAlex now meters requests: without a key they come out of a small daily
+# budget shared by everyone on the same network address. A key is free.
+OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "").strip()
 S2_API_KEY      = os.environ.get("S2_API_KEY", "")
 CORE_API_KEY    = os.environ.get("CORE_API_KEY", "")
 # Shadow-library fallback is opt-in only (--allow-scihub / web "Advanced" toggle).
@@ -675,7 +679,10 @@ NON_RESEARCH_PATTERNS = [
     r"^reply\s+to\b",
     r"^response\s+to\b",
     r"^comment\s+on\b",
-    r"^(?:[A-Z]{1,3}\d{2,5}[-\s]|\d{3,5}\s+|[A-Z]\d{3,4}\s+)[A-Z].*$",  # e.g. P040 Diagnostic..., MP30-18...
+    # Conference abstract numbers: "P040 Diagnostic…", "PO123 …", "MP30-18 …", "1234 Title…".
+    # Kept narrow on purpose: two-digit codes (C60, P53, IL17, G20) and leading
+    # years ("2024 Roadmap…") are real paper titles.
+    r"^(?:[A-Z]{1,3}\d{3,5}\s+|[A-Z]{1,3}\d{1,3}-\d{1,3}[:.\s]+|(?!(?:19|20)\d\d\s)\d{3,5}\s+)[A-Z].*$",
 ]
 
 DISCIPLINARY_NEGATIVE_TERMS = {
@@ -692,6 +699,15 @@ TECHNICAL_DOMAINS = {
     "anode", "cathode", "lithium", "zinc", "sodium", "catalyst", "electrocatalyst", "supercapacitor",
     "solar", "photovoltaic", "fuel cell", "perovskite", "graphene", "polymer", "solid state",
     "interphase", "sei", "conductivity", "impedance", "voltammetry", "dft", "oer", "orr",
+}
+
+_GENERIC_SHORT_TOKENS = {"ai", "ml", "2d", "3d", "1d", "0d"}
+CHEMISTRY_QUERY_TOKENS = {t for t in ALLOWED_SHORT_TOKENS if len(t) >= 2 and t not in _GENERIC_SHORT_TOKENS}
+HEALTH_QUERY_TERMS = {
+    "health", "healthcare", "medical", "medicine", "clinic", "cancer", "drug", "drugs", "vaccine", "vaccines",
+    "nursing", "nurse", "infection", "virus", "covid", "diabetes", "vitamin", "deficiency", "nutrition",
+    "radiology", "cardiology", "neurology", "psychiatry", "dental", "pharmacy", "pharmaceutical", "biomedical",
+    "epidemiology", "symptom", "symptoms", "treatment", "education", "students", "school", "learning",
 }
 
 def _stem(w: str) -> str:
@@ -752,7 +768,9 @@ def check_paper_relevance(
 
     # 1. Non-research / Errata / Meeting abstract filter
     for pat in NON_RESEARCH_PATTERNS:
-        if re.search(pat, c_title_lower):
+        # The abstract-number pattern ("P040 Diagnostic…") is written with
+        # capitals; it was tested against the lower-cased title and never matched.
+        if re.search(pat, c_title if "[A-Z]" in pat else c_title_lower):
             return False, 0.0, f"Filtered: non-research or erratum ('{pat}')"
 
     # 2. Clean keywords and focus tokens
@@ -773,9 +791,13 @@ def check_paper_relevance(
     # Inspect disciplinary context across raw query terms
     all_query_str = f"{kw_raw} {focus_raw}".strip()
     raw_query_words = [w.lower() for w in re.split(r"\W+", all_query_str) if w]
-    query_has_medical = any(w in DISCIPLINARY_NEGATIVE_TERMS for w in raw_query_words)
+    query_has_medical = any(w in DISCIPLINARY_NEGATIVE_TERMS or w in HEALTH_QUERY_TERMS for w in raw_query_words)
+    # "Technical" here means materials / chemistry / energy. Generic short
+    # tokens (ai, ml, 2d…) and one-letter element symbols do not count: they
+    # made "AI in healthcare" or "vitamin C" look like battery queries, and the
+    # guard then threw away every paper with "patient" or "clinical" in its title.
     query_is_technical = any(w in TECHNICAL_DOMAINS for w in raw_query_words) or any(
-        t in ALLOWED_SHORT_TOKENS for t in combined_query_tokens
+        w in CHEMISTRY_QUERY_TOKENS for w in raw_query_words
     )
 
     # 3. Disciplinary Collision Guard
@@ -939,9 +961,22 @@ def rand_proxy() -> dict[str, str] | None:
 def jitter(lo: float = 0.2, hi: float = 0.5):
     time.sleep(random.uniform(lo, hi))
 
+_TRACKING_PARAMS = re.compile(r"^(utm_[a-z]+|fbclid|gclid|mc_cid|mc_eid|ref|referrer|source|casa_token)$", re.I)
+
 def normalise_url(url: str) -> str:
-    p = urlparse(url)
-    return f"{p.scheme}://{p.netloc}{p.path}".rstrip("/")
+    """Identity of a URL for de-duplication.
+
+    The query string is part of the identity: Europe PMC and PubMed serve every
+    PDF from one path and tell papers apart only by ``?accid=PMC123``. Dropping
+    the query made every paper after the first look like a duplicate, so those
+    sources returned a single result. Only tracking parameters and the fragment
+    are ignored; the remaining parameters are sorted so order does not matter."""
+    p = urlparse(url or "")
+    params = sorted(
+        (k.lower(), v) for k, v in parse_qsl(p.query, keep_blank_values=True) if not _TRACKING_PARAMS.match(k))
+    query = "&".join(f"{k}={v}" for k, v in params)
+    base = f"{p.scheme.lower()}://{p.netloc.lower()}{p.path}".rstrip("/")
+    return f"{base}?{query}" if query else base
 
 def _is_real_http_url(url: str) -> bool:
     return bool(url) and url.startswith(("http://", "https://"))
@@ -964,6 +999,36 @@ def open_stealth_session(profile: str = "chrome120"):
 API_TIMEOUT = 12  # Fast failover timeout for metadata harvest APIs
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _thread_local = threading.local()
+
+def openalex_params(params: dict) -> dict:
+    """OpenAlex query parameters with the contact address and, if set, the API key."""
+    out = {**params, "mailto": CONTACT_EMAIL}
+    if OPENALEX_API_KEY:
+        out["api_key"] = OPENALEX_API_KEY
+    return out
+
+_source_notes: dict[str, str] = {}      # source name -> why it returned nothing (for the run summary)
+
+def explain_failure(source: str, r, run_id: int | None = None) -> None:
+    """Say why a source gave no results instead of the misleading "harvested 0".
+
+    A blocked, rate-limited or failing source used to look exactly like a
+    source with no matching papers."""
+    if r is None:
+        note = "no answer (network problem or timeout)"
+    elif r.status_code == 200:
+        return
+    elif r.status_code == 429 and "openalex" in source.lower():
+        note = ("daily free budget used up. Get a free key at https://openalex.org (Settings → API key) and set "
+                "OPENALEX_API_KEY" if not OPENALEX_API_KEY else "your API key's daily budget is used up")
+    elif r.status_code == 429:
+        note = "rate limit reached; try again in a few minutes"
+    elif r.status_code in (401, 403):
+        note = f"access refused (HTTP {r.status_code}); it may need an API key"
+    else:
+        note = f"service error (HTTP {r.status_code})"
+    _source_notes[source] = note
+    _log(f"    ⚠️  {source} unavailable: {note}", run_id=run_id)
 
 def polite_ua() -> str:
     """Identifying User-Agent for scholarly metadata APIs (gets the 'polite pool')."""
@@ -997,6 +1062,8 @@ def safe_get(url: str, ctx: DownloadContext | None = None, **kwargs) -> requests
                                    proxies=rand_proxy(), **kwargs)
             if r.status_code in _RETRYABLE_STATUS and attempt < max_retries:
                 retry_header = (r.headers.get("Retry-After") or "").strip()
+                if retry_header.isdigit() and int(retry_header) > 60:
+                    return r                     # a daily quota: retrying in seconds cannot help
                 if retry_header.isdigit():
                     wait = min(float(retry_header), 10.0)
                 else:
@@ -1217,10 +1284,10 @@ def harvest_openalex(keywords: str, y1: str, y2: str, max_res: int = 250, ctx=No
             "per-page": per_page,
             "cursor": cursor,
             "select": "id,doi,title,authorships,publication_year,cited_by_count,primary_location,best_oa_location,locations,open_access,abstract_inverted_index,concepts,type",
-            "mailto": CONTACT_EMAIL,
         }
-        r = safe_get(base, ctx=ctx, params=params, headers={"User-Agent": polite_ua()})
+        r = safe_get(base, ctx=ctx, params=openalex_params(params), headers={"User-Agent": polite_ua()})
         if r is None or r.status_code != 200:
+            explain_failure("OpenAlex", r)
             break
         data = safe_json(r)
         results = data.get("results") or []
@@ -1284,7 +1351,8 @@ def harvest_openalex(keywords: str, y1: str, y2: str, max_res: int = 250, ctx=No
             break
         jitter(0.2, 0.4)
 
-    _log(f"  ✅ OpenAlex harvested {len(found)} candidates")
+    if found or "OpenAlex" not in _source_notes:      # a failed source already said why
+        _log(f"  ✅ OpenAlex harvested {len(found)} candidates")
     return found
 
 # ── 2. Crossref ───────────────────────────────────────────────────────────────
@@ -1293,7 +1361,10 @@ def harvest_crossref(keywords: str, y1: str, y2: str, max_res: int = 250, ctx=No
     found: list[Paper] = []
     _log("  🔗 Crossref: searching journal literature…")
     base = "https://api.crossref.org/works"
-    cursor = "*"
+    # Offset paging, not cursors: a cursor request ignores relevance and walks
+    # the index in storage order, so the first 200 items were unrelated to the
+    # query (measured: 0 relevant of 100 with a cursor, 98 of 100 without).
+    offset = 0
     rows = min(100, max_res)
     year_filter = f"from-pub-date:{y1}-01-01,until-pub-date:{y2}-12-31,type:journal-article"
     page = 0
@@ -1304,12 +1375,14 @@ def harvest_crossref(keywords: str, y1: str, y2: str, max_res: int = 250, ctx=No
             "query.bibliographic": keywords,
             "filter": year_filter,
             "rows": rows,
-            "cursor": cursor,
+            "offset": offset,
+            "sort": "score", "order": "desc",
             "select": "DOI,title,author,container-title,ISSN,published,published-print,published-online,is-referenced-by-count,link,resource,type",
             "mailto": CONTACT_EMAIL,
         }
         r = safe_get(base, ctx=ctx, params=params)
         if r is None or r.status_code != 200:
+            explain_failure("Crossref", r)
             break
         msg = safe_json(r).get("message") or {}
         items = msg.get("items", [])
@@ -1357,12 +1430,13 @@ def harvest_crossref(keywords: str, y1: str, y2: str, max_res: int = 250, ctx=No
                       relevance_score=rel_score, source="Crossref")
             add_paper_candidate(found, p)
 
-        cursor = msg.get("next-cursor")
-        if not cursor or len(items) < rows:
+        offset += rows
+        if len(items) < rows:
             break
         jitter(0.2, 0.4)
 
-    _log(f"  ✅ Crossref harvested {len(found)} candidates")
+    if found or "Crossref" not in _source_notes:      # a failed source already said why
+        _log(f"  ✅ Crossref harvested {len(found)} candidates")
     return found
 
 # ── 3. Europe PMC ─────────────────────────────────────────────────────────────
@@ -1384,6 +1458,7 @@ def harvest_europepmc(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=N
         }
         r = safe_get(base, ctx=ctx, params=params)
         if r is None or r.status_code != 200:
+            explain_failure("Europe PMC", r)
             break
         body = safe_json(r)
         results = (body.get("resultList") or {}).get("result") or []
@@ -1438,7 +1513,8 @@ def harvest_europepmc(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=N
             break
         jitter(0.2, 0.4)
 
-    _log(f"  ✅ Europe PMC harvested {len(found)} candidates")
+    if found or "Europe PMC" not in _source_notes:      # a failed source already said why
+        _log(f"  ✅ Europe PMC harvested {len(found)} candidates")
     return found
 
 # ── 4. PubMed / NCBI E-Utilities ──────────────────────────────────────────────
@@ -1452,9 +1528,13 @@ def harvest_pubmed(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=None
     query = f"({plain_query(keywords)}) AND ({y1}/01/01[pdat] : {y2}/12/31[pdat])"
     r = safe_get(base_search, ctx=ctx, params={
         "db": "pmc", "term": query, "retmode": "json", "retmax": min(max_res, 100),
+        # Without this PMC answers newest-first, so the 100 ids were recent
+        # papers that merely mention the words (1 relevant of 50, versus 23).
+        "sort": "relevance",
         "tool": "ArticlesDownloader", "email": CONTACT_EMAIL,
     })
     if r is None or r.status_code != 200:
+        explain_failure("PubMed/PMC", r)
         return found
 
     id_list = (safe_json(r).get("esearchresult") or {}).get("idlist") or []
@@ -1523,7 +1603,10 @@ def harvest_semantic_scholar(keywords: str, y1: str, y2: str, max_res: int = 150
     })
     if r is None or r.status_code != 200:
         if r is not None and r.status_code == 429:
+            _source_notes["Semantic Scholar"] = "rate limit reached (a free S2_API_KEY raises it)"
             _log("    ⏳ Semantic Scholar rate-limited (set S2_API_KEY for higher limits); continuing.")
+        else:
+            explain_failure("Semantic Scholar", r)
         return found
     items = safe_json(r).get("data") or []
 
@@ -1571,6 +1654,7 @@ def harvest_doaj(keywords: str, y1: str, y2: str, max_res: int = 100, ctx=None,
             "page": page, "pageSize": size, "sort": "created_date:desc",
         })
         if r is None or r.status_code != 200:
+            explain_failure("DOAJ", r)
             break
         results = safe_json(r).get("results") or []
         if not results:
@@ -1619,7 +1703,8 @@ def harvest_doaj(keywords: str, y1: str, y2: str, max_res: int = 100, ctx=None,
         page += 1
         jitter(0.2, 0.4)
 
-    _log(f"  ✅ DOAJ harvested {len(found)} candidates")
+    if found or "DOAJ" not in _source_notes:      # a failed source already said why
+        _log(f"  ✅ DOAJ harvested {len(found)} candidates")
     return found
 
 # ── 7. arXiv ──────────────────────────────────────────────────────────────────
@@ -1647,6 +1732,7 @@ def harvest_arxiv(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=None,
             "sortBy": "relevance", "sortOrder": "descending",
         })
         if r is None or r.status_code != 200:
+            explain_failure("arXiv", r)
             break
         try:
             root = ET.fromstring(r.content)
@@ -1695,7 +1781,8 @@ def harvest_arxiv(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=None,
         start += batch
         jitter(0.4, 0.8)
 
-    _log(f"  ✅ arXiv harvested {len(found)} candidates")
+    if found or "arXiv" not in _source_notes:      # a failed source already said why
+        _log(f"  ✅ arXiv harvested {len(found)} candidates")
     return found
 
 # ── 8. CORE.ac.uk ─────────────────────────────────────────────────────────────
@@ -1827,12 +1914,11 @@ def enrich_with_openalex(papers: list[Paper], ctx: DownloadContext | None = None
         if is_cancelled(ctx) or failed_batches >= 2:
             break
         batch = dois[i:i + 50]
-        r = safe_get("https://api.openalex.org/works", ctx=ctx, params={
+        r = safe_get("https://api.openalex.org/works", ctx=ctx, params=openalex_params({
             "filter": "doi:" + "|".join(batch),
             "per-page": 50,
             "select": "doi,title,authorships,publication_year,cited_by_count,primary_location,locations,abstract_inverted_index,concepts",
-            "mailto": CONTACT_EMAIL,
-        })
+        }))
         if r is None or r.status_code != 200:
             failed_batches += 1
             continue
@@ -2348,6 +2434,14 @@ def _download_article(data: tuple, rank: int | None) -> dict:
     # 4. Add original URL
     raw_candidates.append(url)
 
+    # 5. Open copies in PubMed Central: turn every PMC landing page among the
+    #    candidates into its direct PDF link. Only the paper's main URL used to
+    #    get this treatment, so a PMC copy found through Unpaywall or OpenAlex
+    #    was fetched as a web page with no PDF link and the paper failed.
+    for pmc_id in dict.fromkeys(m.group(0).upper() for u in list(raw_candidates)
+                                for m in [re.search(r"PMC\d{4,}", u or "", re.I)] if m):
+        raw_candidates.append(f"https://europepmc.org/backend/ptpmcrender.fcgi?accid={pmc_id}&blobtype=pdf")
+
     # Dedup and prioritize candidate URLs
     seen_cands = set()
     candidate_urls = []
@@ -2832,8 +2926,12 @@ def rank_papers(papers: list[Paper], sort_strategy: str = "quartile_cits") -> li
     elif sort_strategy == "relevance":
         papers.sort(key=lambda p: (-p.relevance_score, -p.citations))
     else:  # 'quartile_cits'
+        # Within a quartile, papers that match the whole query come before
+        # partial matches; citations order each group. Otherwise a well-cited
+        # "vitamin D deficiency" paper outranks every "vitamin C deficiency" one.
         q_order = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4, "Preprint": 5, "Unranked": 6, "": 7}
-        papers.sort(key=lambda p: (q_order.get(p.quartile, 9), -p.citations, -p.relevance_score))
+        papers.sort(key=lambda p: (q_order.get(p.quartile, 9), 0 if p.relevance_score >= FULL_MATCH else 1,
+                                   -p.citations, -p.relevance_score))
     return papers
 
 def _begin_run(folder: Path, ctx: DownloadContext | None) -> int:
@@ -2846,6 +2944,7 @@ def _begin_run(folder: Path, ctx: DownloadContext | None) -> int:
         seen_urls.clear()
         seen_dois.clear()
         seen_titles.clear()
+    _source_notes.clear()
     run_id = ctx.run_id if ctx else 1
     with lock_run_id:
         active_run_id = run_id
@@ -2944,6 +3043,10 @@ def harvest_and_rank(
                 for p in cand:
                     p.keyword = label if multi_kw else ""
                     papers.append(p)
+
+    if _source_notes and not is_cancelled(ctx):
+        _log("  ⚠️  Sources that could not be searched: "
+             + "; ".join(f"{name} ({why.split('.')[0]})" for name, why in _source_notes.items()), run_id=run_id)
 
     if is_cancelled(ctx) or not papers:
         if not papers and not is_cancelled(ctx):
@@ -3290,6 +3393,40 @@ def _paper_from_openalex_item(item: dict) -> Paper:
         candidate_urls=cand, relevance_score=1.0, source="DOI list",
     )
 
+_ARXIV_DOI = re.compile(r"^10\.48550/arxiv\.(.+)$", re.I)
+
+def _arxiv_paper_for_doi(doi: str, ctx: DownloadContext | None = None) -> Paper | None:
+    """Metadata for an arXiv DOI (10.48550/arXiv.<id>). These are registered
+    with DataCite, not Crossref, so the Crossref fallback finds nothing and the
+    paper used to be saved as "Untitled.pdf" with an empty citation."""
+    m = _ARXIV_DOI.match(doi or "")
+    if not m:
+        return None
+    arxiv_id = m.group(1)
+    r = safe_get("https://export.arxiv.org/api/query", ctx=ctx, params={"id_list": arxiv_id, "max_results": 1},
+                 retries=2, quiet=True)
+    if r is None or r.status_code != 200:
+        return None
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    try:
+        entry = ET.fromstring(r.content).find("atom:entry", ns)
+    except ET.ParseError:
+        return None
+    if entry is None:
+        return None
+    title = clean_title(entry.findtext("atom:title", "", ns) or "")
+    if title == "Untitled" or title.lower() == "error":
+        return None
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+    return Paper(
+        url=pdf_url, title=title, doi=doi,
+        authors=[a.findtext("atom:name", "", ns) for a in entry.findall("atom:author", ns)
+                 if a.findtext("atom:name", "", ns)],
+        year=(entry.findtext("atom:published", "", ns) or "")[:4], journal="arXiv preprint",
+        abstract=re.sub(r"\s+", " ", entry.findtext("atom:summary", "", ns) or "").strip(),
+        candidate_urls=[pdf_url], relevance_score=1.0, source="DOI list",
+    )
+
 def fetch_papers_by_doi(dois: list[str], ctx: DownloadContext | None = None) -> list[Paper]:
     """Resolve DOIs to full metadata (OpenAlex batch, Crossref fallback)."""
     run_id = ctx.run_id if ctx else None
@@ -3298,9 +3435,8 @@ def fetch_papers_by_doi(dois: list[str], ctx: DownloadContext | None = None) -> 
         if is_cancelled(ctx):
             break
         batch = dois[i:i + 50]
-        r = safe_get("https://api.openalex.org/works", ctx=ctx, headers={"User-Agent": polite_ua()}, params={
-            "filter": "doi:" + "|".join(batch), "per-page": 50, "mailto": CONTACT_EMAIL,
-        })
+        r = safe_get("https://api.openalex.org/works", ctx=ctx, headers={"User-Agent": polite_ua()},
+                     params=openalex_params({"filter": "doi:" + "|".join(batch), "per-page": 50}))
         for item in (safe_json(r).get("results") or []) if r is not None and r.status_code == 200 else []:
             p = _paper_from_openalex_item(item)
             if p.doi:
@@ -3308,6 +3444,10 @@ def fetch_papers_by_doi(dois: list[str], ctx: DownloadContext | None = None) -> 
 
     for d in dois:
         if d.lower() in found or is_cancelled(ctx):
+            continue
+        arxiv_paper = _arxiv_paper_for_doi(d, ctx)
+        if arxiv_paper is not None:
+            found[d.lower()] = arxiv_paper
             continue
         r = safe_get(f"https://api.crossref.org/works/{quote(d, safe='/')}", ctx=ctx, retries=2,
                      params={"mailto": CONTACT_EMAIL}, quiet=True)
@@ -3317,7 +3457,7 @@ def fetch_papers_by_doi(dois: list[str], ctx: DownloadContext | None = None) -> 
                    for a in msg.get("author", []) if a.get("family")] if msg else []
         dparts = ((msg.get("published") or {}).get("date-parts") or [[""]]) if msg else [[""]]
         found[d.lower()] = Paper(
-            url=f"https://doi.org/{d}", title=title if title != "Untitled" else f"DOI {d}", doi=d,
+            url=f"https://doi.org/{d}", title=title if title and title != "Untitled" else f"DOI {d}", doi=d,
             authors=authors, year=str(dparts[0][0] or "") if dparts and dparts[0] else "",
             journal=((msg.get("container-title") or [""])[0] if msg else ""),
             issns=list(msg.get("ISSN") or []) if msg else [],
@@ -4712,6 +4852,7 @@ def create_flask_app():
             "stealth_engine": HAS_CFFI, "bs4": HAS_BS4,
             "contact_email": CONTACT_EMAIL, "allow_scihub_default": ALLOW_SCIHUB_DEFAULT,
             "has_s2_key": bool(S2_API_KEY), "has_core_key": bool(CORE_API_KEY),
+            "has_openalex_key": bool(OPENALEX_API_KEY),
             "platform": sys.platform,
         })
 

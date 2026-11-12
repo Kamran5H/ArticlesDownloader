@@ -9,6 +9,8 @@ sys.path.insert(0, str(ROOT))
 
 import Articles_v2 as art  # noqa: E402
 
+REAL_SAFE_GET = art.safe_get      # the autouse fixture below replaces art.safe_get
+
 
 class FakeResponse:
     def __init__(self, content=b"", status_code=200, headers=None, url="https://example.org/x"):

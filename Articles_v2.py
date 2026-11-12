@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import html
@@ -91,6 +92,7 @@ import xml.etree.ElementTree as ET
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import requests
+from glob import escape as glob_escape
 from urllib.parse import urlparse, urljoin, quote
 
 # Optional high-performance / stealth libraries
@@ -120,12 +122,14 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 
 APP_NAME        = "Articles Downloader"
-APP_VERSION     = "11.0"
+APP_VERSION     = "11.1"
 
 MAX_ARTICLES    = 500
 MAX_WORKERS     = 12          # Concurrency: gentle on scholarly APIs
 REQUEST_TIMEOUT = 45          # Timeout for PDFs and slow CDNs
 MAX_REQUESTS_PER_ARTICLE = 10 # Candidate link trials per article
+DOWNLOAD_LOOKAHEAD = 4        # Papers fetched beyond the open slots, so a slow site does not stall the run
+RANK_WAIT_SECONDS = 60        # Longest a finished download waits for better-ranked papers still in progress
 MAX_BACKOFF_S   = 25          # Maximum back-off sleep time
 MAX_PDF_BYTES   = 120 * 1024 * 1024  # Refuse absurdly large "PDFs" (protects RAM)
 DEFAULT_MIN_RELEVANCE = 0.60  # Default 60% minimum relevance matching
@@ -192,6 +196,16 @@ class Paper:
     relevance_score: float = 0.0
     concepts: list[str] = field(default_factory=list)
 
+    def __post_init__(self):
+        # APIs occasionally send numbers as strings or null; ranking sorts on
+        # citations, so one bad value used to raise TypeError for the whole run.
+        try:
+            self.citations = max(0, int(self.citations or 0))
+        except (TypeError, ValueError):
+            self.citations = 0
+        self.year = str(self.year or "").strip()
+        self.doi = str(self.doi or "").strip()
+
     def clean_doi(self) -> str:
         if not self.doi:
             return ""
@@ -219,16 +233,22 @@ _sse_subscribers: list[queue.Queue] = []
 _subscribers_lock = threading.Lock()
 
 def _broadcast_sse(event_data: dict):
+    """Fan an event out to every open browser stream.
+
+    A slow or backgrounded tab can fill its queue. It used to be removed from
+    the subscriber list while its HTTP stream stayed open, so that window
+    showed frozen progress until reloaded. Now the oldest event is dropped to
+    make room: progress events are cumulative, so nothing important is lost."""
     with _subscribers_lock:
-        dead = []
         for q in _sse_subscribers:
             try:
                 q.put_nowait(event_data)
-            except Exception:
-                dead.append(q)
-        for q in dead:
-            if q in _sse_subscribers:
-                _sse_subscribers.remove(q)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(event_data)
+                except (queue.Empty, queue.Full):
+                    pass
 
 active_run_id = 0
 lock_run_id = threading.Lock()
@@ -247,6 +267,39 @@ class DownloadContext:
         self.lock = threading.Lock()
         self.kw_targets: dict[str, int] = {}
         self.kw_done:    dict[str, int] = {}
+        # Ranks of papers being downloaded right now (see wait_for_better_ranked).
+        self.rank_changed = threading.Condition(self.lock)
+        self.in_flight_ranks: set[int] = set()
+
+    def start_rank(self, rank: int | None):
+        if rank is not None:
+            with self.lock:
+                self.in_flight_ranks.add(rank)
+
+    def finish_rank(self, rank: int | None):
+        if rank is not None:
+            with self.rank_changed:
+                self.in_flight_ranks.discard(rank)
+                self.rank_changed.notify_all()
+
+    def wait_for_better_ranked(self, rank: int | None, timeout: float) -> None:
+        """Hold a finished download until better-ranked papers have had their turn.
+
+        Several papers are fetched at once for speed. Without this, a fast
+        site ranked 9th could take a slot that the slower paper ranked 2nd was
+        about to fill. A paper may be saved only while the open slots outnumber
+        the better-ranked papers still in progress. Must be called with
+        ``self.lock`` held (it waits on the lock's condition)."""
+        if rank is None:
+            return
+        deadline = time.monotonic() + timeout
+        while not self.cancellation_event.is_set():
+            open_slots = self.target_downloads - self.successful_downloads
+            better = sum(1 for r in self.in_flight_ranks if r < rank)
+            remaining = deadline - time.monotonic()
+            if open_slots <= 0 or better < open_slots or remaining <= 0:
+                return
+            self.rank_changed.wait(min(remaining, 0.5))
 
     def _at_capacity(self, keyword: str | None) -> bool:
         if self.successful_downloads >= self.target_downloads:
@@ -310,14 +363,7 @@ def sleep_check_cancel(seconds: float, ctx: DownloadContext | None) -> bool:
     if not ctx:
         time.sleep(seconds)
         return False
-    deadline = time.monotonic() + seconds
-    while True:
-        if ctx.cancellation_event.is_set():
-            return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(0.1, remaining))
+    return ctx.cancellation_event.wait(max(0.0, seconds))
 
 def is_cancelled(ctx: DownloadContext | None = None) -> bool:
     if ctx is not None:
@@ -1312,7 +1358,7 @@ def harvest_europepmc(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=N
     base = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
     page_size = min(100, max_res)
     cursor = "*"
-    query = f"({keywords}) AND (PUB_YEAR:[{y1} TO {y2}]) AND (HAS_FT:Y OR OPEN_ACCESS:y)"
+    query = f"({plain_query(keywords)}) AND (PUB_YEAR:[{y1} TO {y2}]) AND (HAS_FT:Y OR OPEN_ACCESS:y)"
     page = 0
 
     while len(found) < max_res and not is_cancelled(ctx) and page < 2:
@@ -1388,7 +1434,7 @@ def harvest_pubmed(keywords: str, y1: str, y2: str, max_res: int = 150, ctx=None
     base_search = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
     base_summary = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
-    query = f"({keywords}) AND ({y1}/01/01[pdat] : {y2}/12/31[pdat])"
+    query = f"({plain_query(keywords)}) AND ({y1}/01/01[pdat] : {y2}/12/31[pdat])"
     r = safe_get(base_search, ctx=ctx, params={
         "db": "pmc", "term": query, "retmode": "json", "retmax": min(max_res, 100),
         "tool": "ArticlesDownloader", "email": CONTACT_EMAIL,
@@ -1647,7 +1693,7 @@ def harvest_core(keywords: str, y1: str, y2: str, max_res: int = 100, ctx=None,
 
     headers = {"Authorization": f"Bearer {CORE_API_KEY}"} if CORE_API_KEY else {}
     r = safe_get(base, ctx=ctx, headers=headers, retries=2, params={
-        "q": f"({keywords}) AND yearPublished>={y1} AND yearPublished<={y2}",
+        "q": f"({plain_query(keywords)}) AND yearPublished>={y1} AND yearPublished<={y2}",
         "limit": size, "offset": 0, "exclude": "fullText",
     })
     if r is None or r.status_code != 200:
@@ -2056,6 +2102,90 @@ def _looks_like_pdf(content: bytes) -> bool:
     """A real PDF starts with the %PDF- magic (some servers prepend a BOM/whitespace)."""
     return b"%PDF-" in content[:1024]
 
+MIN_PDF_BYTES = 8192
+
+def pdf_problem(content: bytes) -> str:
+    """Why these bytes are not a usable PDF ('' when they are).
+
+    Besides the size limits this catches downloads cut off mid-transfer: every
+    complete PDF ends with an ``%%EOF`` marker (after ``startxref``), and a file
+    without one opens as "damaged" in every reader."""
+    size = len(content)
+    if not _looks_like_pdf(content):
+        return "not a PDF"
+    if size < MIN_PDF_BYTES:
+        return f"PDF too small ({size} bytes)"
+    if size > MAX_PDF_BYTES:
+        return f"PDF too large ({size // (1024 * 1024)} MB)"
+    tail = content[-8192:]
+    if b"%%EOF" not in tail and b"startxref" not in tail:
+        return "PDF is incomplete (download was cut off)"
+    return ""
+
+class DocumentTooLarge(ValueError):
+    """The server is sending more than MAX_PDF_BYTES."""
+
+class FetchedDocument:
+    """What a download attempt produced (body already read, connection released)."""
+    __slots__ = ("content", "status_code", "headers", "url")
+
+    def __init__(self, content: bytes, status_code: int, headers, url: str):
+        self.content = content
+        self.status_code = status_code
+        self.headers = headers
+        self.url = url
+
+def _read_capped(resp, limit: int = MAX_PDF_BYTES) -> bytes:
+    """Read a streamed body, refusing anything larger than `limit`.
+
+    The whole body used to be loaded before its size was checked, so twelve
+    workers hitting a multi-gigabyte file could exhaust memory."""
+    declared = str(resp.headers.get("Content-Length") or "")
+    if declared.isdigit() and int(declared) > limit:
+        raise DocumentTooLarge(f"file too large ({int(declared) // (1024 * 1024)} MB)")
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=256 * 1024):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise DocumentTooLarge(f"file too large (over {limit // (1024 * 1024)} MB)")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+def _download_session(profile: str):
+    """One keep-alive session per worker thread and browser profile.
+
+    Opening a new session for every candidate URL repeated the TLS handshake
+    each time; publishers serve many candidates from the same host."""
+    cache = getattr(_thread_local, "download_sessions", None)
+    if cache is None:
+        cache = _thread_local.download_sessions = {}
+    session = cache.get(profile)
+    if session is None:
+        session = cache[profile] = open_stealth_session(profile)
+    return session
+
+def _drop_download_session(profile: str):
+    cache = getattr(_thread_local, "download_sessions", None) or {}
+    session = cache.pop(profile, None)
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+def _get_capped(session, url: str, **kwargs) -> FetchedDocument:
+    resp = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True, stream=True, **kwargs)
+    try:
+        return FetchedDocument(_read_capped(resp), resp.status_code, resp.headers, str(resp.url))
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
 def _is_tls_error(exc: Exception) -> bool:
     text = f"{type(exc).__name__} {exc}".lower()
     return any(k in text for k in ("ssl", "certificate", "tls handshake"))
@@ -2063,15 +2193,23 @@ def _is_tls_error(exc: Exception) -> bool:
 def _fetch_document(url: str, profile: str, ctx: DownloadContext | None):
     """Fetch a candidate URL with TLS verification; fall back to unverified TLS only
     for hosts with broken certificate chains (common on university repositories)."""
-    with open_stealth_session(profile) as session:
+    session = _download_session(profile)
+    try:
+        return _get_capped(session, url)
+    except DocumentTooLarge:
+        _drop_download_session(profile)      # the half-read connection cannot be reused
+        raise
+    except Exception as exc:
+        _drop_download_session(profile)      # a failed connection may be left in a bad state
+        if not _is_tls_error(exc) or is_cancelled(ctx):
+            raise
+        _log(f"    🔐 TLS verification failed for {urlparse(url).netloc}; retrying without it",
+             run_id=ctx.run_id if ctx else None)
         try:
-            return session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        except Exception as exc:
-            if not _is_tls_error(exc) or is_cancelled(ctx):
-                raise
-            _log(f"    🔐 TLS verification failed for {urlparse(url).netloc}; retrying without it",
-                 run_id=ctx.run_id if ctx else None)
-            return session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True, verify=False)
+            return _get_capped(_download_session(profile), url, verify=False)
+        except Exception:
+            _drop_download_session(profile)
+            raise
 
 _path_lock = threading.Lock()
 
@@ -2092,7 +2230,82 @@ def _make_path(folder: Path, title: str, ext: str) -> Path:
             path.touch()
     return path
 
+def _safe_stem(title: str) -> str:
+    return re.sub(r'[\\/*?":<>|]', "_", clean_title(title)).strip().rstrip(". ")[:80]
+
+def find_identical_pdf(folder: Path, title: str, content: bytes) -> Path | None:
+    """An earlier download of exactly these bytes under this title, if any.
+
+    Re-running a topic used to save every paper again as ``Title_1.pdf``,
+    ``Title_2.pdf``…; identical files are now recognised and reused."""
+    stem = _safe_stem(title)
+    if not stem:
+        return None
+    digest = None
+    try:
+        candidates = [folder / f"{stem}.pdf", *sorted(folder.glob(f"{glob_escape(stem)}_*.pdf"))]
+    except OSError:
+        return None
+    for path in candidates:
+        try:
+            if not path.is_file() or path.stat().st_size != len(content):
+                continue
+            digest = digest or hashlib.sha1(content, usedforsecurity=False).digest()
+            if hashlib.sha1(path.read_bytes(), usedforsecurity=False).digest() == digest:
+                return path
+        except OSError:
+            continue
+    return None
+
+def save_pdf(folder: Path, title: str, content: bytes) -> tuple[Path, bool]:
+    """Write a PDF safely. Returns (path, reused_existing_file).
+
+    The bytes go to a ``.part`` file first and are moved into place only when
+    complete, so a crash or a full disk never leaves a half-written PDF."""
+    existing = find_identical_pdf(folder, title, content)
+    if existing is not None:
+        return existing, True
+    path = _make_path(folder, title, ".pdf")          # reserves a unique name
+    part = path.with_name(path.name + ".part")
+    try:
+        with open(part, "wb") as fh:
+            fh.write(content)
+        os.replace(part, path)
+    except BaseException:
+        for leftover in (part, path):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+        raise
+    return path, False
+
+def short_error(exc: BaseException | str) -> str:
+    """A readable one-line reason for the log and the results table."""
+    text = re.sub(r"\s+", " ", str(exc)).strip() or type(exc).__name__
+    text = re.sub(r"^Failed to perform, ", "", text)
+    text = re.sub(r"\s*See https?://\S+.*$", "", text)
+    low = text.lower()
+    if "could not resolve" in low or "name or service not known" in low or "getaddrinfo" in low:
+        return "site address could not be found"
+    if "timed out" in low or "timeout" in low:
+        return "site did not answer in time"
+    if "connect tunnel failed" in low or "connection refused" in low or "failed to connect" in low:
+        return "could not connect to the site"
+    return text[:90]
+
 def download_article(data: tuple) -> dict:
+    """Try every source for one paper. `data` is (url, title, doi, folder, ctx,
+    keyword, extra_candidates[, rank]); `rank` (0 = best) enables rank-ordered saving."""
+    rank = data[7] if len(data) > 7 else None
+    ctx = data[4]
+    ctx.start_rank(rank)
+    try:
+        return _download_article(data[:7], rank)
+    finally:
+        ctx.finish_rank(rank)
+
+def _download_article(data: tuple, rank: int | None) -> dict:
     url, title, doi, folder, ctx, keyword, extra_candidates = data
     result = {"url": url, "title": title, "success": False, "bytes": 0, "skipped": False}
 
@@ -2180,35 +2393,28 @@ def download_article(data: tuple) -> dict:
 
             # Case 1: Got Valid Full-Text PDF
             if actual_pdf:
-                if content_size < 8192:
-                    raise ValueError(f"PDF too small ({content_size} bytes)")
-                if content_size > MAX_PDF_BYTES:
-                    raise ValueError(f"PDF too large ({content_size // (1024 * 1024)} MB)")
+                problem = pdf_problem(resp_content)
+                if problem:
+                    raise ValueError(problem)
 
                 with ctx.lock:
-                    if ctx._at_capacity(keyword):
+                    ctx.wait_for_better_ranked(rank, RANK_WAIT_SECONDS)
+                    if ctx._at_capacity(keyword) or ctx.cancellation_event.is_set():
                         result["skipped"] = True
                         return result
                     ctx.successful_downloads += 1
                     if keyword is not None:
                         ctx.kw_done[keyword] = ctx.kw_done.get(keyword, 0) + 1
 
-                path = None
                 try:
-                    path = _make_path(folder, title, ".pdf")
-                    with open(path, "wb") as fh:
-                        fh.write(resp_content)
+                    path, reused = save_pdf(folder, title, resp_content)
                 except Exception:
                     with ctx.lock:
                         ctx.successful_downloads -= 1
                         if keyword is not None:
                             ctx.kw_done[keyword] = max(0, ctx.kw_done.get(keyword, 0) - 1)
-                    if path is not None:
-                        try:
-                            path.unlink()
-                        except OSError:
-                            pass
                     raise
+                result["reused"] = reused
 
                 with ctx.lock:
                     ctx.total_bytes += content_size
@@ -2266,7 +2472,7 @@ def download_article(data: tuple) -> dict:
             raise ValueError(f"Unsupported content-type: {ct}")
 
         except Exception as exc:
-            err_str = str(exc)
+            err_str = short_error(exc)
             extracted_doi = _extract_doi(current_url) or doi
             if extracted_doi and not tried_unpaywall:
                 tried_unpaywall = True
@@ -2291,7 +2497,7 @@ def download_article(data: tuple) -> dict:
                     _log(f"    🔓 Trying Sci-Hub for DOI {extracted_doi}", run_id=ctx.run_id)
                     continue
 
-            if "Connection reset" in err_str or "10054" in err_str:
+            if "Connection reset" in str(exc) or "10054" in str(exc):
                 wait = min(2 ** total_requests + random.uniform(0.5, 1.5), MAX_BACKOFF_S)
                 if sleep_check_cancel(wait, ctx):
                     result["skipped"] = True
@@ -2303,7 +2509,7 @@ def download_article(data: tuple) -> dict:
                         return result
 
     if not result["success"] and not result["skipped"]:
-        result["error"] = err_str[:60]
+        result["error"] = err_str[:90]
         with ctx.lock:
             ctx.failed_downloads += 1
     return result
@@ -2412,6 +2618,17 @@ def _history_conn() -> sqlite3.Connection:
         pass
     return conn
 
+@contextmanager
+def _history():
+    """History connection that is always closed (and committed on success).
+    Connections used to leak whenever a query raised."""
+    conn = _history_conn()
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
 def normalize_query(keywords: str, focus: str = "") -> str:
     """Canonical history key: keywords + focus words, de-duplicated, lower-case.
 
@@ -2425,18 +2642,15 @@ def normalize_query(keywords: str, focus: str = "") -> str:
 
 def query_seen_count(query_norm: str) -> int:
     try:
-        conn = _history_conn()
-        n = conn.execute("SELECT COUNT(*) FROM history WHERE query=?", (query_norm,)).fetchone()[0]
-        conn.close()
-        return n
+        with _history() as conn:
+            return conn.execute("SELECT COUNT(*) FROM history WHERE query=?", (query_norm,)).fetchone()[0]
     except Exception:
         return 0
 
 def history_identifiers(query_norm: str) -> set[str]:
     try:
-        conn = _history_conn()
-        rows = conn.execute("SELECT identifier FROM history WHERE query=?", (query_norm,)).fetchall()
-        conn.close()
+        with _history() as conn:
+            rows = conn.execute("SELECT identifier FROM history WHERE query=?", (query_norm,)).fetchall()
         return {r[0].lower() for r in rows if r[0]}
     except Exception:
         return set()
@@ -2446,29 +2660,26 @@ def _paper_identifier(p: Paper) -> str:
 
 def record_history(query_norm: str, papers: list[Paper]):
     try:
-        conn = _history_conn()
         today = time.strftime("%Y-%m-%d %H:%M")
-        for p in papers:
-            if p.pdf_path:
-                conn.execute(
-                    """INSERT OR REPLACE INTO history
-                       (query, identifier, title, quartile, year, journal, citations, filename, date,
-                        doi, authors, pdf_path, url, source, relevance)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (query_norm, _paper_identifier(p), clean_title(p.title)[:300], p.quartile,
-                     p.year, (p.journal or "")[:200], p.citations, Path(p.pdf_path).name, today,
-                     p.clean_doi(), json.dumps(p.authors[:25], ensure_ascii=False), p.pdf_path,
-                     p.url, p.source, round(p.relevance_score, 3))
-                )
-        conn.commit()
-        conn.close()
+        with _history() as conn:
+            for p in papers:
+                if p.pdf_path:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO history
+                           (query, identifier, title, quartile, year, journal, citations, filename, date,
+                            doi, authors, pdf_path, url, source, relevance)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (query_norm, _paper_identifier(p), clean_title(p.title)[:300], p.quartile,
+                         p.year, (p.journal or "")[:200], p.citations, Path(p.pdf_path).name, today,
+                         p.clean_doi(), json.dumps(p.authors[:25], ensure_ascii=False), p.pdf_path,
+                         p.url, p.source, round(p.relevance_score, 3))
+                    )
     except Exception as e:
         _log(f"  ⚠️  History save error: {e}")
 
 def history_topics(search: str = "", limit: int = 60) -> list[dict]:
     """Past topics with paper counts, newest first; optional substring filter on topic/titles."""
     try:
-        conn = _history_conn()
         sql = """SELECT query, COUNT(DISTINCT identifier), MAX(date),
                         SUM(CASE WHEN quartile IN ('Q1','Q2') THEN 1 ELSE 0 END)
                  FROM history WHERE query IS NOT NULL AND query != ''"""
@@ -2479,8 +2690,8 @@ def history_topics(search: str = "", limit: int = 60) -> list[dict]:
             args += [like, like]
         sql += " GROUP BY query ORDER BY MAX(date) DESC LIMIT ?"
         args.append(int(limit))
-        rows = conn.execute(sql, args).fetchall()
-        conn.close()
+        with _history() as conn:
+            rows = conn.execute(sql, args).fetchall()
         return [{"query": r[0], "count": r[1], "date": r[2] or "", "high_impact": r[3] or 0}
                 for r in rows]
     except Exception:
@@ -2489,13 +2700,12 @@ def history_topics(search: str = "", limit: int = 60) -> list[dict]:
 def history_papers(query_norm: str) -> list[dict]:
     """Every paper recorded for one topic (for the History browser)."""
     try:
-        conn = _history_conn()
-        rows = conn.execute(
-            """SELECT identifier, title, quartile, year, journal, citations, filename, date,
-                      doi, authors, pdf_path, url, source, relevance
-               FROM history WHERE query=? ORDER BY date DESC, citations DESC""", (query_norm,)
-        ).fetchall()
-        conn.close()
+        with _history() as conn:
+            rows = conn.execute(
+                """SELECT identifier, title, quartile, year, journal, citations, filename, date,
+                          doi, authors, pdf_path, url, source, relevance
+                   FROM history WHERE query=? ORDER BY date DESC, citations DESC""", (query_norm,)
+            ).fetchall()
     except Exception:
         return []
     out = []
@@ -2517,11 +2727,8 @@ def history_papers(query_norm: str) -> list[dict]:
 def delete_history(query_norm: str) -> int:
     """Forget one topic (does not touch any PDF on disk)."""
     try:
-        conn = _history_conn()
-        n = conn.execute("DELETE FROM history WHERE query=?", (query_norm,)).rowcount
-        conn.commit()
-        conn.close()
-        return n
+        with _history() as conn:
+            return conn.execute("DELETE FROM history WHERE query=?", (query_norm,)).rowcount
     except Exception:
         return 0
 
@@ -2529,11 +2736,10 @@ def history_download_roots() -> set[Path]:
     """Folders that hold PDFs recorded in history (used to authorise file serving)."""
     roots: set[Path] = set()
     try:
-        conn = _history_conn()
-        for (pp,) in conn.execute("SELECT DISTINCT pdf_path FROM history WHERE pdf_path IS NOT NULL"):
-            if pp:
-                roots.add(Path(pp).resolve().parent)
-        conn.close()
+        with _history() as conn:
+            for (pp,) in conn.execute("SELECT DISTINCT pdf_path FROM history WHERE pdf_path IS NOT NULL"):
+                if pp:
+                    roots.add(Path(pp).resolve().parent)
     except Exception:
         pass
     return roots
@@ -2579,6 +2785,28 @@ def resolve_sources(sources) -> list[str]:
             if k and k not in out:
                 out.append(k)
     return out or list(ALL_SOURCES)
+
+def normalize_years(year_start, year_end) -> tuple[str, str]:
+    """Clean a year range from any interface: non-numbers fall back to the
+    default window, out-of-range values are clamped, and a reversed range is
+    swapped. Bad years used to reach the sources and fail one by one."""
+    def _year(value, default: int) -> int:
+        try:
+            y = int(str(value).strip())
+        except (TypeError, ValueError):
+            return default
+        return max(1900, min(CURRENT_YEAR + 1, y))
+
+    y1, y2 = _year(year_start, CURRENT_YEAR - 3), _year(year_end, CURRENT_YEAR)
+    if y1 > y2:
+        y1, y2 = y2, y1
+    return str(y1), str(y2)
+
+def plain_query(text: str) -> str:
+    """Keywords with query-syntax characters removed, for APIs whose search
+    box is a query language (Europe PMC, PubMed, CORE): a stray quote or
+    bracket in a pasted title made those sources return an error."""
+    return re.sub(r"\s+", " ", re.sub(r'[()\[\]{}"\\:;]+', " ", text or "")).strip()
 
 def rank_papers(papers: list[Paper], sort_strategy: str = "quartile_cits") -> list[Paper]:
     """Sort in place and return the list (stable, deterministic ordering)."""
@@ -2779,7 +3007,8 @@ def download_papers(
 ) -> list[Paper]:
     """PHASE 3 + 4: download the top ``max_articles`` papers (Q1/Q2 -> Q1_Q2/, others
     -> Q3_Q4/), then write the citation files and record history."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from collections import deque
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
     folder = Path(save_folder) if save_folder else get_default_save_folder()
     q_hi, q_lo = folder / "Q1_Q2", folder / "Q3_Q4"
@@ -2799,64 +3028,100 @@ def download_papers(
     _log(f"🚀 Downloading top {max_articles} papers with {MAX_WORKERS} threads…"
          f"{'' if ctx.allow_scihub else '  (Sci-Hub fallback: off)'}\n", run_id=run_id)
 
+    rank_of = {id(p): i for i, p in enumerate(papers)}
+
     def _target(p: Paper, balanced: bool) -> tuple:
         dest = q_hi if p.quartile in ("Q1", "Q2") else q_lo
         pk = (p.keyword or None) if balanced else None
-        return (p.url, clean_title(p.title), p.clean_doi(), dest, ctx, pk, p.candidate_urls)
+        # Per-keyword quotas already decide who gets a slot; rank ordering is
+        # for the plain (single query / DOI list / selected) case.
+        rank = None if balanced else rank_of[id(p)]
+        return (p.url, clean_title(p.title), p.clean_doi(), dest, ctx, pk, p.candidate_urls, rank)
 
     by_url: dict[str, Paper] = {p.url: p for p in papers}
     targets = [_target(p, multi_kw) for p in papers]
     done_count = 0
     skipped_urls: set[str] = set()
+    failure_reasons: dict[str, int] = {}
+    saved_count = 0
+
+    def _handle(res: dict):
+        nonlocal done_count, saved_count
+        if res.get("success"):
+            saved_count += 1
+        if res.get("skipped"):
+            skipped_urls.add(res["url"])
+            return
+        skipped_urls.discard(res["url"])
+
+        done_count += 1
+        pp = by_url.get(res["url"])
+        if res["success"] and pp:
+            pp.pdf_path = res.get("path", "")
+            _emit(paper_callback, pp, res)
+        elif not res["success"]:
+            failure_reasons[res.get("error", "failed")] = failure_reasons.get(res.get("error", "failed"), 0) + 1
+
+        with ctx.lock:
+            succ = ctx.successful_downloads
+
+        _emit(progress_callback, succ, max_articles)
+        _emit(status_callback, f"Downloading: {succ}/{max_articles} saved (checked {done_count})",
+              "#3fb950")
+
+        icon = "✅" if res["success"] else "❌"
+        qtag = pp.quartile if pp else ""
+        rel_tag = f"{int(pp.relevance_score * 100)}%" if pp and pp.relevance_score > 0 else "—"
+        if res["success"]:
+            detail = f"{res['bytes'] // 1024} KB" + (" (already saved)" if res.get("reused") else "")
+        else:
+            detail = res.get("error", "failed")[:60]
+        _log(f"  {icon} [{qtag or '—':<4} | {rel_tag:>4}] {res['title'][:50]:<50} {detail}",
+             run_id=run_id)
 
     def _drain(items):
-        nonlocal done_count
+        """Download in rank order with a moving window.
+
+        Every candidate used to be handed to the pool at once, so with a
+        target of 5 the twelve workers raced papers ranked 1-12 and whichever
+        finished first took the slots: the result was often not the five
+        best-ranked papers. Now only the open slots plus a small lookahead are
+        in progress, and download_article saves a paper only once the
+        better-ranked ones still in progress cannot fill the remaining slots."""
         if not items:
             return
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(download_article, item): item for item in items}
-            try:
-                for future in as_completed(futures):
-                    if ctx.cancellation_event.is_set():
-                        for f in futures:
-                            f.cancel()
-                        break
+        pending = deque(items)
+        futures: dict = {}
+        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="pdf")
+
+        def _top_up():
+            with ctx.lock:
+                remaining = ctx.target_downloads - ctx.successful_downloads
+            limit = min(MAX_WORKERS, remaining + DOWNLOAD_LOOKAHEAD) if remaining > 0 else 0
+            while pending and len(futures) < limit and not ctx.cancellation_event.is_set():
+                item = pending.popleft()
+                futures[executor.submit(download_article, item)] = item
+
+        try:
+            _top_up()
+            while futures:
+                finished, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    futures.pop(future, None)
                     try:
-                        res = future.result()
+                        _handle(future.result())
                     except Exception as e:
                         _log(f"  ❌ Thread error: {e}", run_id=run_id)
-                        continue
-                    if res.get("skipped"):
-                        skipped_urls.add(res["url"])
-                        continue
-                    skipped_urls.discard(res["url"])
-
-                    done_count += 1
-                    pp = by_url.get(res["url"])
-                    if res["success"] and pp:
-                        pp.pdf_path = res.get("path", "")
-                        _emit(paper_callback, pp, res)
-
-                    with ctx.lock:
-                        succ = ctx.successful_downloads
-
-                    _emit(progress_callback, succ, max_articles)
-                    _emit(status_callback, f"Downloading: {succ}/{max_articles} saved (checked {done_count})",
-                          "#3fb950")
-
-                    icon = "✅" if res["success"] else "❌"
-                    qtag = pp.quartile if pp else ""
-                    rel_tag = f"{int(pp.relevance_score * 100)}%" if pp and pp.relevance_score > 0 else "—"
-                    detail = f"{res['bytes'] // 1024} KB" if res["success"] else res.get("error", "failed")[:45]
-                    _log(f"  {icon} [{qtag or '—':<4} | {rel_tag:>4}] {res['title'][:50]:<50} {detail}",
-                         run_id=run_id)
-
-                    with ctx.lock:
-                        if ctx.successful_downloads >= ctx.target_downloads:
-                            break
-            finally:
-                for f in futures:
-                    f.cancel()
+                # Count results we have actually received: a worker bumps the
+                # shared counter a moment before its result arrives here.
+                if saved_count >= ctx.target_downloads or ctx.cancellation_event.is_set():
+                    break
+                _top_up()
+        finally:
+            # Do not wait for requests still in progress: once the target is met
+            # (or the run is cancelled) they can no longer save anything, and
+            # waiting kept a finished run "busy" for up to a request timeout.
+            executor.shutdown(wait=False, cancel_futures=True)
 
     # Pass 1: Balanced across keywords
     _drain(targets)
@@ -2894,6 +3159,9 @@ def download_papers(
     _log(f"  {verdict} — {succ} PDFs saved   (Q1_Q2: {hi}  |  Q3_Q4/Preprint: {lo}  |  failed: {failed})",
          run_id=run_id)
     _log(f"  📁 Output Directory: {folder}", run_id=run_id)
+    if failure_reasons:
+        top = sorted(failure_reasons.items(), key=lambda kv: -kv[1])[:4]
+        _log("  Why papers failed: " + "; ".join(f"{n}× {why}" for why, n in top), run_id=run_id)
     _log(f"{'═'*65}\n", run_id=run_id)
 
     if ctx.cancellation_event.is_set():
@@ -2933,6 +3201,8 @@ def execute_research_workflow(
     With ``download=False`` it stops after ranking and returns the candidate pool
     (preview mode); pass the chosen papers to :func:`download_papers` later."""
     folder = Path(save_folder) if save_folder else get_default_save_folder()
+    year_start, year_end = normalize_years(year_start, year_end)
+    max_articles = max(1, min(int(max_articles), MAX_ARTICLES))
     run_id = _begin_run(folder, ctx)
     if ctx is None:
         ctx = DownloadContext(run_id, max_articles, folder)
@@ -4014,7 +4284,7 @@ def paper_to_dict(p: Paper, size_bytes: int | None = None) -> dict:
         "year": p.year,
         "journal": p.journal,
         "doi": p.clean_doi(),
-        "url": p.url,
+        "url": p.url if _is_real_http_url(p.url) else "",
         "citations": p.citations,
         "quartile": p.quartile or "Unranked",
         "relevance_score": round(p.relevance_score, 3),

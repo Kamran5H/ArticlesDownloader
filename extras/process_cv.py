@@ -1,8 +1,10 @@
+import os
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-file_path = r"C:\Users\Public\Documents\My Gamry Data\RCV.DTA"
+file_path = os.environ.get("GAMRY_DTA_PATH", "RCV.DTA")
 
 def parse_gamry_dta(file_path):
     with open(file_path, 'r') as f:
@@ -147,6 +149,6 @@ ax_text.text(0.0, 0.95, info_text, transform=ax_text.transAxes, fontsize=15,
 
 plt.tight_layout()
 
-output_path = r"C:\Users\chkam\OneDrive\Desktop\CV_Analysis_Report.pdf"
+output_path = os.environ.get("CV_REPORT_OUTPUT", str(Path(__file__).resolve().parent / "CV_Analysis_Report.pdf"))
 plt.savefig(output_path, format='pdf', bbox_inches='tight')
 print(f"Report saved to {output_path}")

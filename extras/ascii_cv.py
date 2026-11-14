@@ -1,7 +1,9 @@
+import argparse
+import os
 import pandas as pd
 import numpy as np
 
-file_path = r"C:\Users\Public\Documents\My Gamry Data\RCV.DTA"
+DEFAULT_DTA = os.environ.get("GAMRY_DTA_PATH", "RCV.DTA")
 
 def parse_gamry_dta(file_path):
     with open(file_path, 'r') as f:
@@ -30,15 +32,6 @@ def parse_gamry_dta(file_path):
     df = pd.DataFrame(data_lines, columns=['Pt', 'T', 'Vf', 'Im'])
     return df
 
-df = parse_gamry_dta(file_path)
-df['Im_uA'] = df['Im'] * 1e6
-
-voltage = df['Vf'].values
-current = df['Im_uA'].values
-
-# ASCII Plot
-import math
-
 def ascii_plot(x, y, width=80, height=40):
     min_x, max_x = min(x), max(x)
     min_y, max_y = min(y), max(y)
@@ -55,8 +48,15 @@ def ascii_plot(x, y, width=80, height=40):
     for row in grid:
         print("".join(row))
 
-ascii_plot(voltage, current)
 
-# Also print the max/min currents to see where they happen
-print("Max current", np.max(current), "at", voltage[np.argmax(current)])
-print("Min current", np.min(current), "at", voltage[np.argmin(current)])
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ASCII plot of Gamry RCV.DTA file")
+    parser.add_argument("file_path", nargs="?", default=DEFAULT_DTA, help="Path to Gamry .DTA file")
+    args = parser.parse_args()
+    df = parse_gamry_dta(args.file_path)
+    df['Im_uA'] = df['Im'] * 1e6
+    voltage = df['Vf'].values
+    current = df['Im_uA'].values
+    ascii_plot(voltage, current)
+    print("Max current", np.max(current), "at", voltage[np.argmax(current)])
+    print("Min current", np.min(current), "at", voltage[np.argmin(current)])
